@@ -13,34 +13,28 @@ This server is designed to be the bridge between a large language model's reason
 
 ## Installation
 
-A complete step-by-step guide is available in [`INSTALL.md`](./INSTALL.md). The short version is:
+A complete step-by-step guide is available in [`INSTALL.md`](./INSTALL.md). The user-focused setup is:
 
-1.  **Install System Dependencies:**
+1.  **Install Prerequisites:**
+    You will need [Homebrew](https://brew.sh/) to install `ripgrep`.
     ```bash
     # Install ripgrep for the search_code tool
     brew install ripgrep
     ```
 
-2.  **Setup Python Environment:**
-    ```bash
-    # Create a virtual environment
-    python3 -m venv venv
-    source venv/bin/activate
-
-    # Install Python packages
-    pip install -r requirements.txt
-    ```
+2.  **Download the Server:**
+    Download or clone this repository to a permanent location on your computer.
 
 3.  **Configure iTerm2:**
     - Open iTerm2.
     - Go to `Scripts > Manage > Install Python Runtime`.
-    - Ensure `Scripts > Manage > AutoLaunch` has "Allow all apps to connect to iTerm2" enabled.
+    - Go to `Scripts > Manage > AutoLaunch` and ensure "Allow all apps to connect to iTerm2" is enabled.
 
 ## Usage
 
-This server is designed to be run by an MCP client, such as the Claude Desktop app. Add the following configuration to your client to make the `iterm2` tools available to your agent.
+This server is designed to be run automatically by an MCP client, such as the Claude Desktop app.
 
-**Note:** Make sure to replace the path with the absolute path to the `iterm2_mcp_server.py` file on your system.
+Add the following configuration to your client's settings. **You must replace `/path/to/your/coder/iterm2_mcp_server.py` with the actual, absolute path** to the file you downloaded.
 
 ```json
 "iterm2": {
@@ -53,6 +47,8 @@ This server is designed to be run by an MCP client, such as the Claude Desktop a
   ]
 }
 ```
+
+That's it. The MCP client will now handle starting the server for you.
 
 ## Tool Reference
 

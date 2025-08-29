@@ -1,101 +1,62 @@
-# Installation Guide 🐒
+# Installation Guide for iTerm2 MCP Server 🐒
+
+This guide provides the steps to set up the iTerm2 MCP Server for use with an MCP client like Claude Desktop.
 
 ## Prerequisites
 
-1.  **macOS** - iTerm2 is macOS-only.
-2.  **Homebrew** - The easiest way to install system dependencies. Install from [brew.sh](https://brew.sh/).
-3.  **iTerm2** - Download from [iterm2.com](https://iterm2.com/).
-4.  **Python 3.8+** - Check with `python3 --version`.
-5.  **ripgrep** - A system dependency for the `search_code` tool. Install with `brew install ripgrep`.
-6.  **iTerm2 Python API** - Must be enabled within iTerm2.
+1.  **macOS**: iTerm2 is macOS-only.
+2.  **Homebrew**: A package manager for macOS, used to install `ripgrep`. You can install it from [brew.sh](https://brew.sh/).
+3.  **iTerm2**: The latest version, downloadable from [iterm2.com](https://iterm2.com/).
+4.  **Python 3.8+**: macOS includes a compatible version of Python by default.
+5.  **`ripgrep`**: A system dependency for the `search_code` tool.
 
-## Step 1: Install System Dependencies
+## Step 1: Install Ripgrep
 
-Open your terminal and run the following command:
+Open your terminal and use Homebrew to install `ripgrep`:
 ```bash
 brew install ripgrep
 ```
 
-## Step 2: Enable iTerm2 Python API
+## Step 2: Download the Server
 
-1. Open iTerm2
-2. Go to **Scripts** → **Manage** → **Install Python Runtime**
-3. Click **Install** if the runtime is not already installed.
-4. Go to **Scripts** → **Manage** → **AutoLaunch** (or similar, depending on iTerm version)
-5. Ensure **Allow all apps to connect to iTerm2** is checked.
+Download or clone this repository to a permanent location on your computer (e.g., `~/Documents/coder`). You will need the absolute path to `iterm2_mcp_server.py` for the final step.
 
-## Step 3: Setup Project and Install Dependencies
-```bash
-# Clone the repository (if you haven't already)
-# git clone ...
-# cd iterm2-mcp-server
+## Step 3: Configure iTerm2
 
-# Create a Python virtual environment
-python3 -m venv venv
-source venv/bin/activate
+You must grant permission for external scripts to control iTerm2. This is a one-time setup step inside iTerm2 itself.
 
-# Install the required Python packages
-pip install -r requirements.txt
-```
+1.  Open iTerm2.
+2.  Go to the menu bar and select **Scripts** → **Manage** → **Install Python Runtime**.
+3.  Click **Install** if the runtime is not already present.
+4.  Go to **Scripts** → **Manage** → **AutoLaunch**.
+5.  Ensure the checkbox for **"Allow all apps to connect to iTerm2"** is enabled.
 
-## Step 4: Configure Your MCP Client
+## Step 4: Configure Your MCP Client (Claude Desktop)
 
-Add this to your MCP client configuration (e.g., for Claude Desktop):
+1.  Find the absolute path to the `iterm2_mcp_server.py` script you downloaded. You can do this by navigating to the directory in your terminal and running `pwd`.
+2.  Open your MCP client's configuration file (e.g., `claude_desktop_config.json`).
+3.  Add the following JSON object to the `mcpServers` section.
+
+**Important:** Replace `/path/to/your/coder/iterm2_mcp_server.py` with the real absolute path you found in the previous step.
 
 ```json
-{
-  "mcpServers": {
-    "iterm2": {
-      "command": "python",
-      "args": ["/full/path/to/iterm2_mcp_server.py"]
-    }
-  }
+"iterm2": {
+  "command": "uvx",
+  "args": [
+    "--with", "mcp",
+    "--with", "iterm2", 
+    "python",
+    "/path/to/your/coder/iterm2_mcp_server.py"
+  ]
 }
 ```
 
+Setup is now complete. The client will automatically start the server when needed.
+
 ## Troubleshooting
 
-### "Failed to connect to iTerm2"
-
-- Make sure iTerm2 is running
-- Verify Python API is enabled in iTerm2
-- Check that "Allow all apps to connect to iTerm2" is enabled
-
-### Import Errors
-
-- Make sure all dependencies are installed: `pip install -r requirements.txt`
-- Check your Python version: `python --version`
-
-### Permission Errors
-
-- Make sure the script is executable: `chmod +x iterm2_mcp_server.py`
-- `search_code` tool fails with a "'rg' command not found" error:
-  - Make sure you have installed `ripgrep` via Homebrew: `brew install ripgrep`.
-
-## Quick Start (Manual)
-
-1. Start iTerm2.
-2. Activate your virtual environment: `source venv/bin/activate`.
-3. Run the server: `python iterm2_mcp_server.py`.
-
-## Available Commands
-
-Once connected via an MCP client, you can use these tools:
-
-- `run_command`
-- `read_terminal_output`
-- `send_text`
-- `create_tab`
-- `create_session`
-- `clear_screen`
-- `list_profiles`
-- `switch_profile`
-- `get_session_info`
-- `read_file`
-- `write_file`
-- `edit_file`
-- `list_directory`
-- `search_code`
+-   **"Failed to connect to iTerm2"**: Make sure iTerm2 is running and you have completed Step 3 correctly.
+-   **`search_code` tool fails**: This likely means `ripgrep` is not installed correctly. Run `brew install ripgrep` again.
 
 ---
 
