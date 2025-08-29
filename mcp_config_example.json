@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "iterm2": {
+      "command": "python",
+      "args": ["/path/to/your/iterm2_mcp_server.py"],
+      "env": {
+        "PYTHONPATH": "/path/to/your/project"
+      }
+    }
+  }
+} 
