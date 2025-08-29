@@ -6,6 +6,7 @@ A Model Context Protocol server for controlling iTerm2
 
 import json
 import asyncio
+import os
 from typing import Optional
 
 import iterm2
@@ -409,6 +410,132 @@ async def write_file(file_path: str, content: str) -> str:
             "message": f"Successfully wrote {len(content)} characters to {file_path}"
         }
         return json.dumps(result, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def read_file(file_path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+    """
+    Reads the contents of a file, optionally slicing by line numbers.
+
+    Args:
+        file_path (str): The path to the file to read.
+        start_line (Optional[int]): The 1-indexed line number to start reading from.
+        end_line (Optional[int]): The 1-indexed line number to stop reading at (inclusive).
+
+    Returns:
+        str: A JSON string with the file content or an error.
+    """
+    try:
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+        
+        if start_line is not None and end_line is not None:
+            # Adjust for 0-based indexing and slice
+            content = "".join(lines[start_line - 1:end_line])
+        elif start_line is not None:
+            content = "".join(lines[start_line - 1:])
+        else:
+            content = "".join(lines)
+            
+        result = {
+            "success": True,
+            "file_path": file_path,
+            "content": content
+        }
+        return json.dumps(result, indent=2)
+    except FileNotFoundError:
+        return json.dumps({"success": False, "error": f"File not found: {file_path}"}, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def list_directory(path: str, recursive: bool = False) -> str:
+    """
+    Lists the contents of a directory in a structured format.
+
+    Args:
+        path (str): The path to the directory to list.
+        recursive (bool): If True, lists contents recursively. Defaults to False.
+
+    Returns:
+        str: A JSON string with a list of files and directories, or an error.
+    """
+    try:
+        if not os.path.isdir(path):
+            return json.dumps({"success": False, "error": f"Not a directory: {path}"}, indent=2)
+
+        contents = []
+        if recursive:
+            for root, dirs, files in os.walk(path):
+                for name in files:
+                    full_path = os.path.join(root, name)
+                    contents.append({"name": name, "path": full_path, "is_directory": False})
+                for name in dirs:
+                    full_path = os.path.join(root, name)
+                    contents.append({"name": name, "path": full_path, "is_directory": True})
+        else:
+            for name in os.listdir(path):
+                full_path = os.path.join(path, name)
+                is_dir = os.path.isdir(full_path)
+                contents.append({"name": name, "path": full_path, "is_directory": is_dir})
+        
+        result = {
+            "success": True,
+            "path": path,
+            "contents": contents
+        }
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def edit_file(file_path: str, start_line: int, end_line: int, new_content: str) -> str:
+    """
+    Replaces a specific block of lines in a file with new content.
+
+    Args:
+        file_path (str): The file to modify.
+        start_line (int): The 1-indexed first line of the block to replace.
+        end_line (int): The 1-indexed last line of the block to replace (inclusive).
+        new_content (str): The new text to insert.
+
+    Returns:
+        str: A JSON string confirming success or reporting an error.
+    """
+    try:
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+
+        # Adjust for 0-based indexing
+        start_index = start_line - 1
+        end_index = end_line
+
+        # Ensure new_content ends with a newline if it's not empty
+        if new_content and not new_content.endswith('\n'):
+            new_content += '\n'
+            
+        new_lines = new_content.splitlines(True) if new_content else []
+
+        # Replace the specified lines
+        lines[start_index:end_index] = new_lines
+
+        with open(file_path, 'w') as f:
+            f.writelines(lines)
+
+        result = {
+            "success": True,
+            "file_path": file_path,
+            "message": f"Successfully replaced lines {start_line}-{end_line} in {file_path}"
+        }
+        return json.dumps(result, indent=2)
+    except FileNotFoundError:
+        return json.dumps({"success": False, "error": f"File not found: {file_path}"}, indent=2)
+    except IndexError:
+        return json.dumps({"success": False, "error": "Line numbers are out of range for the file."}, indent=2)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
