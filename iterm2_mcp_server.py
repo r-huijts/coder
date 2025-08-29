@@ -7,6 +7,7 @@ A Model Context Protocol server for controlling iTerm2
 import json
 import asyncio
 import os
+import subprocess
 from typing import Optional
 
 import iterm2
@@ -536,6 +537,66 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
         return json.dumps({"success": False, "error": f"File not found: {file_path}"}, indent=2)
     except IndexError:
         return json.dumps({"success": False, "error": "Line numbers are out of range for the file."}, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def search_code(query: str, path: str = ".", case_sensitive: bool = True) -> str:
+    """
+    Searches for a string in files using ripgrep and returns structured results.
+
+    This tool leverages ripgrep (rg) for high-speed, gitignore-aware code searching.
+    Ripgrep must be installed on the system for this tool to function.
+
+    Args:
+        query (str): The string or regex pattern to search for.
+        path (str): The file or directory to search in. Defaults to the current directory.
+        case_sensitive (bool): Whether the search should be case-sensitive. Defaults to True.
+
+    Returns:
+        str: A JSON string containing a list of search results or an error.
+    """
+    try:
+        command = ['rg', '--json', query, path]
+        if not case_sensitive:
+            command.insert(1, '-i')
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0 and stderr:
+            # Ripgrep exits with 1 if no matches are found, which is not an error for us.
+            # A real error will have content in stderr.
+            error_message = stderr.decode().strip()
+            if "No files were searched" not in error_message:
+                 return json.dumps({"success": False, "error": error_message}, indent=2)
+
+        results = []
+        for line in stdout.decode().splitlines():
+            try:
+                message = json.loads(line)
+                if message['type'] == 'match':
+                    data = message['data']
+                    results.append({
+                        "file_path": data['path']['text'],
+                        "line_number": data['line_number'],
+                        "line_content": data['lines']['text'].strip()
+                    })
+            except (json.JSONDecodeError, KeyError):
+                # Ignore lines that aren't valid JSON or don't have the expected structure
+                continue
+        
+        return json.dumps({"success": True, "query": query, "results": results}, indent=2)
+    except FileNotFoundError:
+        return json.dumps({
+            "success": False, 
+            "error": "The 'rg' (ripgrep) command was not found. Please install ripgrep."
+        }, indent=2)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 

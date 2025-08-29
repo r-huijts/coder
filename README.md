@@ -1,83 +1,91 @@
-# iTerm2 MCP Server 🐒
+# iTerm2 MCP Server for AI Coding Agents 🐒
 
-A Model Context Protocol (MCP) server that lets you control iTerm2 through Python scripts. Because sometimes you need a little monkey magic to make your terminal dance!
+A Model Context Protocol (MCP) server that transforms iTerm2 into a powerful backend for AI coding agents. It provides a structured toolkit for agents to interact with the terminal, manipulate the filesystem, and search code with precision.
 
-## Features
+This server is designed to be the bridge between a large language model's reasoning capabilities and the practical, hands-on tasks of software development. Instead of relying on fragile shell command parsing, it provides a robust, JSON-based API for core development tasks.
 
-- 🎭 **Create and manage tabs** - Because one tab is never enough
-- 🎪 **Run commands** - Execute shell commands in any session
-- 🎨 **Session management** - Split, resize, and organize your terminal like a pro
-- 🎯 **Profile switching** - Change themes faster than a chameleon on a disco floor
-- 📝 **Text manipulation** - Send text, clear screens, and more
+## Core Capabilities
+
+-   🧠 **Code Intelligence:** Perform structured, gitignore-aware code searches using `ripgrep`. Instead of parsing `grep` output, the agent receives clean JSON with file paths, line numbers, and matching content.
+-   📂 **Precise Filesystem I/O:** Read, write, and perform surgical line-based edits on files. This avoids the ambiguity of `sed` or `echo` and allows the agent to safely manipulate code.
+-   🖥️ **Full Terminal Control:** Create tabs, split panes, run commands, and read screen output. The agent has a visible, interactive workspace within iTerm2.
+-   🤖 **Structured JSON API:** All tools return predictable JSON objects, making it easy for an agent to parse success/failure states and data without guessing.
 
 ## Installation
 
-1. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+A complete step-by-step guide is available in [`INSTALL.md`](./INSTALL.md). The short version is:
 
-2. **Enable iTerm2 Python API:**
-   - Open iTerm2
-   - Go to Scripts → Manage → Install Python Runtime
-   - Enable "Allow all apps to connect to iTerm2"
+1.  **Install System Dependencies:**
+    ```bash
+    # Install ripgrep for the search_code tool
+    brew install ripgrep
+    ```
+
+2.  **Setup Python Environment:**
+    ```bash
+    # Create a virtual environment
+    python3 -m venv venv
+    source venv/bin/activate
+
+    # Install Python packages
+    pip install -r requirements.txt
+    ```
+
+3.  **Configure iTerm2:**
+    - Open iTerm2.
+    - Go to `Scripts > Manage > Install Python Runtime`.
+    - Ensure `Scripts > Manage > AutoLaunch` has "Allow all apps to connect to iTerm2" enabled.
 
 ## Usage
 
-### Running the Server
+This server is designed to be run by an MCP client, such as the Claude Desktop app. Add the following configuration to your client to make the `iterm2` tools available to your agent.
 
-```bash
-python iterm2_mcp_server.py
-```
-
-### Connecting from an MCP Client
-
-Add this to your MCP client configuration:
+**Note:** Make sure to replace the path with the absolute path to the `iterm2_mcp_server.py` file on your system.
 
 ```json
-{
-  "mcpServers": {
-    "iterm2": {
-      "command": "python",
-      "args": ["path/to/iterm2_mcp_server.py"]
-    }
-  }
+"iterm2": {
+  "command": "uvx",
+  "args": [
+    "--with", "mcp",
+    "--with", "iterm2", 
+    "python",
+    "/path/to/your/coder/iterm2_mcp_server.py"
+  ]
 }
 ```
 
-## Available Tools
+## Tool Reference
 
-- `create_tab` - Create a new tab with optional profile
-- `create_session` - Create a new session in current tab
-- `run_command` - Execute a command in the active session
-- `send_text` - Send text to the active session
-- `clear_screen` - Clear the current screen
-- `list_profiles` - Get available iTerm2 profiles
-- `switch_profile` - Change the profile of current session
-- `get_session_info` - Get information about current session
+The following tools are available through the MCP server.
 
-## Example Usage
+### Terminal Control
 
-```python
-# Create a new tab with a dark theme
-await session.call_tool("create_tab", {"profile": "Dark"})
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10` | Executes a shell command in the active iTerm2 session and optionally captures the output. |
+| `read_terminal_output` | `timeout: int = 5` | Reads the entire visible contents of the active iTerm2 screen. |
+| `send_text` | `text: str` | Sends a string of text to the active session without adding a newline. |
+| `create_tab` | `profile: str = None` | Creates a new tab in the current iTerm2 window. |
+| `create_session` | `profile: str = None` | Creates a new session (split pane) in the current tab. |
+| `clear_screen` | | Clears the screen of the active session (like `Ctrl+L`). |
+| `list_profiles` | | Retrieves a list of all available iTerm2 profiles. |
+| `switch_profile` | `profile: str` | Switches the profile of the current iTerm2 session. |
+| `get_session_info` | | Gets information about the current window, tab, and session IDs. |
 
-# Run a command
-await session.call_tool("run_command", {"command": "ls -la"})
+### Filesystem I/O
 
-# Send some text
-await session.call_tool("send_text", {"text": "echo 'Hello from MCP!'"})
-```
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `read_file` | `file_path: str`, `start_line: int = None`, `end_line: int = None` | Reads a file, with options to specify a range of line numbers. |
+| `write_file` | `file_path: str`, `content: str` | Writes content to a file, overwriting it if it exists or creating it if it doesn't. |
+| `edit_file` | `file_path: str`, `start_line: int`, `end_line: int`, `new_content: str` | Replaces a specific block of lines in a file with new content. |
+| `list_directory` | `path: str`, `recursive: bool = False` | Lists the contents of a directory, returning a structured list of files and subdirectories. |
 
-## Requirements
+### Code Intelligence
 
-- macOS (iTerm2 is macOS-only, sorry Windows friends!)
-- iTerm2 with Python API enabled
-- Python 3.8+
-
-## License
-
-MIT - Because sharing is caring! 🐒
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `search_code` | `query: str`, `path: str = "."`, `case_sensitive: bool = True` | Searches for a string/regex in files using `ripgrep` and returns structured results (file, line number, content). |
 
 ---
 
