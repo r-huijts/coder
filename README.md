@@ -1,8 +1,8 @@
-# iTerm2 MCP Server for AI Coding Agents 🐒
+# iTerm2 MCP Server AI Coding Agent 🐒
 
-A Model Context Protocol (MCP) server that transforms iTerm2 into a powerful backend for AI coding agents. It provides a structured toolkit for agents to interact with the terminal, manipulate the filesystem, and search code with precision.
+A Model Context Protocol (MCP) server that transforms iTerm2 into a powerful AI coding agent. It provides a structured toolkit for agents to interact with the terminal, manipulate the filesystem, and search code with precision.
 
-This server is designed to be the bridge between a large language model's reasoning capabilities and the practical, hands-on tasks of software development. Instead of relying on fragile shell command parsing, it provides a robust, JSON-based API for core development tasks.
+This server is designed to be the bridge between a large language model's reasoning capabilities and the practical, hands-on tasks of software development.
 
 ## Core Capabilities
 
