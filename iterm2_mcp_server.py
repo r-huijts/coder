@@ -8,6 +8,7 @@ import json
 import asyncio
 import os
 import subprocess
+import sys
 from typing import Optional
 
 import iterm2
@@ -101,6 +102,10 @@ async def create_session(profile: Optional[str] = None) -> str:
 async def run_command(command: str, wait_for_output: bool = True, timeout: int = 10) -> str:
     """
     Runs a command in the active iTerm2 session.
+
+    Note: For writing content to files, please use the `write_file` tool instead of shell
+    commands like `echo`, `cat`, or `heredoc`. The `write_file` tool is more reliable
+    and the preferred method for file creation.
 
     Args:
         command (str): The command to execute.
@@ -391,8 +396,9 @@ async def write_file(file_path: str, content: str) -> str:
     """
     Writes content to a specified file on the local filesystem.
 
-    This tool uses standard Python file I/O and is more reliable for file creation
-    and modification than using shell commands like 'echo' or 'heredoc'.
+    This is the **preferred** and most reliable method for creating or overwriting files.
+    It uses standard Python file I/O and should be used instead of shell
+    commands like 'echo' or 'heredoc' via the `run_command` tool.
 
     Args:
         file_path (str): The absolute or relative path to the file.
@@ -497,6 +503,9 @@ async def list_directory(path: str, recursive: bool = False) -> str:
 async def edit_file(file_path: str, start_line: int, end_line: int, new_content: str) -> str:
     """
     Replaces a specific block of lines in a file with new content.
+
+    Use this tool for targeted modifications of existing files. For creating new files
+    or completely overwriting existing files, use the `write_file` tool.
 
     Args:
         file_path (str): The file to modify.
@@ -603,4 +612,10 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
 
 if __name__ == "__main__":
     # Run the FastMCP server
-    mcp.run() 
+    print("Starting MCP server...", file=sys.stderr)
+    try:
+        mcp.run()
+    except Exception as e:
+        print(f"MCP server crashed: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr) 
