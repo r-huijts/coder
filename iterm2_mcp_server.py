@@ -21,35 +21,31 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("iTerm2")
 
 
-def get_iterm2_context(func):
+async def connect_to_iterm2():
     """
-    A decorator that creates an iTerm2 connection and provides context objects
-    (connection, app, window, tab, session) to the wrapped function.
-    It also handles exceptions and returns a JSON error response.
+    Creates an iTerm2 connection and returns a context dictionary.
     """
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        try:
-            connection = await iterm2.Connection.async_create()
-            context = { "connection": connection, "app": None, "window": None, "tab": None, "session": None }
-            
-            app = await iterm2.async_get_app(connection)
-            context["app"] = app
-            context["window"] = app.current_window
-            if context["window"]:
-                context["tab"] = context["window"].current_tab
-                if context["tab"]:
-                    context["session"] = context["tab"].current_session
-            
-            return await func(ctx=context, *args, **kwargs)
-        except Exception as e:
-            return json.dumps({"success": False, "error": f"iTerm2 connection failed: {str(e)}"}, indent=2)
-    return wrapper
+    try:
+        connection = await iterm2.Connection.async_create()
+        app = await iterm2.async_get_app(connection)
+        window = app.current_window
+        tab = window.current_tab if window else None
+        session = tab.current_session if tab else None
+        
+        return {
+            "connection": connection,
+            "app": app,
+            "window": window,
+            "tab": tab,
+            "session": session,
+            "error": None
+        }
+    except Exception as e:
+        return {"error": f"iTerm2 connection failed: {str(e)}"}
 
 
 @mcp.tool()
-@get_iterm2_context
-async def create_tab(ctx, profile: Optional[str] = None) -> str:
+async def create_tab(profile: Optional[str] = None) -> str:
     """
     Creates a new tab in the current iTerm2 window.
 
@@ -60,6 +56,10 @@ async def create_tab(ctx, profile: Optional[str] = None) -> str:
     Returns:
         str: A JSON string containing the new window, tab, and session IDs.
     """
+    ctx = await connect_to_iterm2()
+    if ctx["error"]:
+        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+
     connection = ctx["connection"]
     if profile:
         profile_obj = await iterm2.Profile.async_get(connection, [profile])
@@ -85,8 +85,7 @@ async def create_tab(ctx, profile: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-@get_iterm2_context
-async def create_session(ctx, profile: Optional[str] = None) -> str:
+async def create_session(profile: Optional[str] = None) -> str:
     """
     Creates a new session (split pane) in the current iTerm2 tab.
 
@@ -97,6 +96,10 @@ async def create_session(ctx, profile: Optional[str] = None) -> str:
     Returns:
         str: A JSON string containing the new session ID.
     """
+    ctx = await connect_to_iterm2()
+    if ctx["error"]:
+        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+
     connection, tab = ctx["connection"], ctx["tab"]
     if not tab:
         return json.dumps({"success": False, "error": "No active iTerm2 tab found."}, indent=2)
@@ -120,8 +123,7 @@ async def create_session(ctx, profile: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-@get_iterm2_context
-async def run_command(ctx, command: str, wait_for_output: bool = True, timeout: int = 10, require_confirmation: bool = False) -> str:
+async def run_command(command: str, wait_for_output: bool = True, timeout: int = 10, require_confirmation: bool = False) -> str:
     """
     Runs a command in the active iTerm2 session.
 
@@ -143,6 +145,10 @@ async def run_command(ctx, command: str, wait_for_output: bool = True, timeout: 
     Returns:
         str: A JSON string containing the execution status and output if captured.
     """
+    ctx = await connect_to_iterm2()
+    if ctx["error"]:
+        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+
     DANGEROUS_COMMANDS = ["rm ", "dd ", "mkfs ", "shutdown ", "reboot "]
     if any(cmd in command for cmd in DANGEROUS_COMMANDS) and not require_confirmation:
         return json.dumps({
@@ -154,8 +160,12 @@ async def run_command(ctx, command: str, wait_for_output: bool = True, timeout: 
     if not session:
         return json.dumps({"success": False, "error": "No active iTerm2 session found."}, indent=2)
 
-    # Send the command
-    await session.async_send_text(f"{command}\n")
+    # Encode the command in base64 to prevent shell interpretation issues
+    import base64
+    encoded_command = base64.b64encode(command.encode('utf-8')).decode('utf-8')
+    
+    # Send the command to be decoded and executed by the shell
+    await session.async_send_text(f"echo '{encoded_command}' | base64 --decode | /bin/zsh\n")
     
     result = {
         "success": True,
@@ -206,8 +216,7 @@ async def run_command(ctx, command: str, wait_for_output: bool = True, timeout: 
 
 
 @mcp.tool()
-@get_iterm2_context
-async def send_text(ctx, text: str) -> str:
+async def send_text(text: str) -> str:
     """
     Sends a string of text to the active iTerm2 session without adding a newline.
 
@@ -217,6 +226,10 @@ async def send_text(ctx, text: str) -> str:
     Returns:
         str: A JSON string confirming the text was sent.
     """
+    ctx = await connect_to_iterm2()
+    if ctx["error"]:
+        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+
     session = ctx["session"]
     if not session:
         return json.dumps({"success": False, "error": "No active iTerm2 session found."}, indent=2)
@@ -234,8 +247,7 @@ async def send_text(ctx, text: str) -> str:
 
 
 @mcp.tool()
-@get_iterm2_context
-async def read_terminal_output(ctx, timeout: int = 5) -> str:
+async def read_terminal_output(timeout: int = 5) -> str:
     """
     Reads the entire visible contents of the active iTerm2 session's screen.
 
@@ -245,6 +257,10 @@ async def read_terminal_output(ctx, timeout: int = 5) -> str:
     Returns:
         str: A JSON string containing the captured terminal output.
     """
+    ctx = await connect_to_iterm2()
+    if ctx["error"]:
+        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+
     session = ctx["session"]
     if not session:
         return json.dumps({"success": False, "error": "No active iTerm2 session found."}, indent=2)
@@ -289,8 +305,7 @@ async def read_terminal_output(ctx, timeout: int = 5) -> str:
 
 
 @mcp.tool()
-@get_iterm2_context
-async def clear_screen(ctx) -> str:
+async def clear_screen() -> str:
     """
     Clears the screen of the active iTerm2 session.
     
@@ -299,6 +314,10 @@ async def clear_screen(ctx) -> str:
     Returns:
         str: A JSON string confirming the screen was cleared.
     """
+    ctx = await connect_to_iterm2()
+    if ctx["error"]:
+        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+
     session = ctx["session"]
     if not session:
         return json.dumps({"success": False, "error": "No active iTerm2 session found."}, indent=2)
@@ -315,14 +334,17 @@ async def clear_screen(ctx) -> str:
 
 
 @mcp.tool()
-@get_iterm2_context
-async def list_profiles(ctx) -> str:
+async def list_profiles() -> str:
     """
     Retrieves a list of all available iTerm2 profiles.
 
     Returns:
         str: A JSON string containing a list of profile names.
     """
+    ctx = await connect_to_iterm2()
+    if ctx["error"]:
+        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+
     connection = ctx["connection"]
     profiles = await iterm2.Profile.async_get(connection)
     profile_list = [profile.name for profile in profiles]
@@ -338,8 +360,7 @@ async def list_profiles(ctx) -> str:
 
 
 @mcp.tool()
-@get_iterm2_context
-async def switch_profile(ctx, profile: str) -> str:
+async def switch_profile(profile: str) -> str:
     """
     Switches the profile of the current iTerm2 session.
 
@@ -349,6 +370,10 @@ async def switch_profile(ctx, profile: str) -> str:
     Returns:
         str: A JSON string confirming the profile switch.
     """
+    ctx = await connect_to_iterm2()
+    if ctx["error"]:
+        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+
     connection, session = ctx["connection"], ctx["session"]
     if not session:
         return json.dumps({"success": False, "error": "No active iTerm2 session found."}, indent=2)
@@ -370,14 +395,17 @@ async def switch_profile(ctx, profile: str) -> str:
 
 
 @mcp.tool()
-@get_iterm2_context
-async def get_session_info(ctx) -> str:
+async def get_session_info() -> str:
     """
     Gets information about the current iTerm2 window, tab, and session.
 
     Returns:
         str: A JSON string containing the window, tab, and session IDs.
     """
+    ctx = await connect_to_iterm2()
+    if ctx["error"]:
+        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+
     window, tab, session = ctx["window"], ctx["tab"], ctx["session"]
     if not (window and tab and session):
         return json.dumps({"success": False, "error": "Could not retrieve complete session info."}, indent=2)
