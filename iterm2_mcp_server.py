@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import functools
+import shutil
 from typing import Optional
 
 import iterm2
@@ -590,7 +591,23 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
         str: A JSON string containing a list of search results or an error.
     """
     try:
-        command = ['rg', '--json', query, path]
+        # Find the ripgrep executable in a robust way
+        rg_path = shutil.which("rg")
+        if not rg_path:
+            # Fallback to common hardcoded paths if not in PATH
+            common_paths = ["/opt/homebrew/bin/rg", "/usr/local/bin/rg"]
+            for path in common_paths:
+                if os.path.exists(path):
+                    rg_path = path
+                    break
+        
+        if not rg_path:
+            return json.dumps({
+                "success": False, 
+                "error": "The 'rg' (ripgrep) command was not found in your PATH or common locations. Please install it and ensure it's accessible."
+            }, indent=2)
+
+        command = [rg_path, '--json', query, path]
         if not case_sensitive:
             command.insert(1, '-i')
 
@@ -624,11 +641,6 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
                 continue
         
         return json.dumps({"success": True, "query": query, "results": results}, indent=2)
-    except FileNotFoundError:
-        return json.dumps({
-            "success": False, 
-            "error": "The 'rg' (ripgrep) command was not found. Please install ripgrep."
-        }, indent=2)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
