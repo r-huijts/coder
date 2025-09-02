@@ -164,8 +164,8 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     import base64
     encoded_command = base64.b64encode(command.encode('utf-8')).decode('utf-8')
     
-    # Send the command to be decoded and executed by the shell
-    await session.async_send_text(f"echo '{encoded_command}' | base64 --decode | /bin/zsh\n")
+    # Inject the command to be decoded and executed by the current shell, avoiding terminal echo
+    await session.async_send_text(f"eval $(echo '{encoded_command}' | base64 --decode)\\n")
     
     result = {
         "success": True,
