@@ -123,7 +123,7 @@ async def create_session(profile: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-async def run_command(command: str, wait_for_output: bool = True, timeout: int = 10, require_confirmation: bool = False, use_base64: bool = False) -> str:
+async def run_command(command: str, wait_for_output: bool = True, timeout: int = 10, require_confirmation: bool = False, use_base64: bool = False, preview: bool = True) -> str:
     """
     Runs a command in the active iTerm2 session.
 
@@ -143,6 +143,8 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
                                      Defaults to False.
         use_base64 (bool): If True, injects a base64-encoded eval line. Defaults to False
                            so the literal command is visible in the terminal.
+        preview (bool): If True and the command is multiline, prints a readable preview
+                        using a safe heredoc before execution. Defaults to True.
 
     Returns:
         str: A JSON string containing the execution status and output if captured.
@@ -170,17 +172,26 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
             "error": "Neither async_send_text nor async_inject_text is available on this iTerm2 Session."
         }, indent=2)
 
-    line_to_send = None
-    if use_base64:
+    is_multiline = "\n" in command
+
+    # For multiline commands, default to base64 injection to avoid quoting/newline issues
+    effective_base64 = use_base64 or is_multiline
+
+    if is_multiline and preview:
+        # Print a readable, non-interpreted preview to the terminal
+        await send_text_method("echo '>>> Executing multiline command:'\n")
+        await send_text_method("cat <<'__MCP_PREVIEW__'\n")
+        await send_text_method(f"{command}\n")
+        await send_text_method("__MCP_PREVIEW__\n")
+
+    if effective_base64:
         # Encode the command in base64 to prevent shell interpretation issues
         import base64
         encoded_command = base64.b64encode(command.encode('utf-8')).decode('utf-8')
-        line_to_send = f"eval $(echo '{encoded_command}' | base64 --decode)\n"
+        await send_text_method(f"eval $(echo '{encoded_command}' | base64 --decode)\n")
     else:
         # Send the command literally so it is visible in the terminal
-        line_to_send = f"{command}\n"
-
-    await send_text_method(line_to_send)
+        await send_text_method(f"{command}\n")
     
     result = {
         "success": True,
