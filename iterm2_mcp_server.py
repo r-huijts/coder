@@ -13,7 +13,6 @@ import functools
 import shutil
 from typing import Optional
 from pathlib import Path
-from urllib.parse import urlparse, unquote
 
 import iterm2
 from mcp.server.fastmcp import FastMCP
@@ -24,120 +23,34 @@ mcp = FastMCP("iTerm2")
 
 
 # -----------------------------
-# Roots management and helpers
+# Safety helpers (no roots enforcement)
 # -----------------------------
-ALLOWED_ROOTS: list[Path] = []
+MASS_EDIT_LINE_THRESHOLD = 200
 
-def _parse_file_uri_or_path(value: str) -> Path:
+def _detect_command_risk(command: str) -> Optional[str]:
     """
-    Accepts either a file:// URI or a filesystem path and returns a resolved Path.
+    Returns a reason if the command is risky and should require confirmation.
     """
-    parsed = urlparse(value)
-    if parsed.scheme and parsed.scheme != "file":
-        raise ValueError(f"Unsupported URI scheme for roots: {parsed.scheme}")
-    if parsed.scheme == "file":
-        raw_path = unquote(parsed.path)
-    else:
-        raw_path = value
-    path = Path(raw_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Root path does not exist: {path}")
-    if not path.is_dir():
-        raise NotADirectoryError(f"Root is not a directory: {path}")
-    return path
+    cmd = command.strip()
+    lower = cmd.lower()
+    risky_substrings = [
+        " rm -rf ", " rm -r ", " rm -fr ", " rm -f ",
+        " dd ", " mkfs ", " diskutil erase", " shutdown ", " reboot ",
+        " chmod -r", " chown -r", " sudo ",
+        " curl ", " wget ", " | sh", " |bash", " | bash", " bash -c ", " sh -c ", " eval ",
+        " apt install ", " apt-get install ", " yum install ", " dnf install ",
+        " brew install ", " pip install ", " pip3 install ", " python -m pip install ",
+        " npm install ", " yarn add ", " pnpm add ", " cargo install ", " go install ", " gem install ",
+        " sed -i ",
+    ]
+    for sub in risky_substrings:
+        if sub in lower:
+            return f"Command matches risky pattern: '{sub.strip()}'."
+    # Obvious redirection writes
+    if any(t in cmd for t in [">", ">>", "2>", "2>>"]):
+        return "Command redirects output; confirm to avoid unintended overwrites."
+    return None
 
-def _is_path_within_roots(target_path: str | Path) -> bool:
-    """
-    Returns True if roots are empty (unrestricted) or if the path is within any allowed root.
-    """
-    try:
-        path_obj = Path(target_path).expanduser().resolve()
-    except Exception:
-        return False
-    if not ALLOWED_ROOTS:
-        return True
-    for root in ALLOWED_ROOTS:
-        try:
-            path_obj.relative_to(root)
-            return True
-        except ValueError:
-            continue
-    return False
-
-def _roots_error_payload(path: str) -> dict:
-    return {
-        "success": False,
-        "error": f"Access to '{path}' is outside configured roots. Set roots via set_roots or adjust the path.",
-        "roots": [str(p) for p in ALLOWED_ROOTS],
-    }
-
-
-def _initialize_roots_from_env() -> None:
-    """
-    Initializes ALLOWED_ROOTS from environment variables if present.
-    Supported variables:
-      - MCP_ROOTS_JSON: JSON array of file:// URIs or paths
-      - MCP_ROOTS: Comma-separated list of file:// URIs or paths
-    """
-    global ALLOWED_ROOTS
-    roots_json = os.getenv("MCP_ROOTS_JSON")
-    roots_csv = os.getenv("MCP_ROOTS") or os.getenv("ALLOWED_ROOTS")
-    values: list[str] = []
-    try:
-        if roots_json:
-            parsed = json.loads(roots_json)
-            if isinstance(parsed, list):
-                values = [str(x) for x in parsed]
-        elif roots_csv:
-            values = [v.strip() for v in roots_csv.split(",") if v.strip()]
-
-        if values:
-            parsed_roots = [_parse_file_uri_or_path(v) for v in values]
-            unique: list[Path] = []
-            for p in parsed_roots:
-                if p not in unique:
-                    unique.append(p)
-            ALLOWED_ROOTS = unique
-            print(f"[MCP] Configured {len(ALLOWED_ROOTS)} root(s) from environment.", file=sys.stderr)
-    except Exception as e:
-        print(f"[MCP] Failed to configure roots from environment: {e}", file=sys.stderr)
-
-
-@mcp.tool()
-async def list_roots() -> str:
-    """
-    Lists currently configured filesystem roots that bound server operations.
-    If empty, operations are unrestricted (not recommended).
-    """
-    return json.dumps({
-        "success": True,
-        "roots": [str(p) for p in ALLOWED_ROOTS],
-        "unrestricted": len(ALLOWED_ROOTS) == 0
-    }, indent=2)
-
-
-@mcp.tool()
-async def set_roots(roots: list[str]) -> str:
-    """
-    Sets the server's allowed filesystem roots. Values may be file:// URIs or paths.
-    Subsequent file operations must reside within these roots.
-    """
-    global ALLOWED_ROOTS
-    try:
-        parsed_roots = [_parse_file_uri_or_path(r) for r in roots]
-        # Deduplicate and sort for stability
-        unique: list[Path] = []
-        for p in parsed_roots:
-            if p not in unique:
-                unique.append(p)
-        ALLOWED_ROOTS = unique
-        return json.dumps({
-            "success": True,
-            "roots": [str(p) for p in ALLOWED_ROOTS],
-            "message": f"Configured {len(ALLOWED_ROOTS)} root(s)"
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 async def connect_to_iterm2():
     """
@@ -246,13 +159,12 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     Runs a command in the active iTerm2 session.
 
     Best practice: Prefer specialized tools over shell when possible.
-      - File writes/overwrites → use `write_file` (safer, handles newlines/quoting, respects roots)
+      - File writes/overwrites → use `write_file` (safer, handles newlines/quoting)
       - In-place edits → use `edit_file` (surgical, avoids brittle sed/ed/perl)
-      - Reading files → use `read_file` (structured JSON, roots-enforced)
+      - Reading files → use `read_file` (structured JSON)
       - Searching → use `search_code` (rg-powered, gitignore-aware)
 
-    Roots: If `working_directory` is provided, it must be within configured roots.
-    Dangerous commands (e.g., rm/dd/mkfs/shutdown/reboot) require `require_confirmation=True`.
+    Risk gating: Potentially destructive/install/network-exec patterns require `require_confirmation=True`.
 
     Pro-tip: For safer file modifications, use `git` commands to stage and commit
     changes, creating a safety net for your work.
@@ -276,25 +188,19 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     if ctx["error"]:
         return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
 
-    DANGEROUS_COMMANDS = ["rm ", "dd ", "mkfs ", "shutdown ", "reboot "]
-    if any(cmd in command for cmd in DANGEROUS_COMMANDS) and not require_confirmation:
-        # Provide an elicitation-style payload for compatible clients
+    risk_reason = _detect_command_risk(command)
+    if risk_reason and not require_confirmation:
         return json.dumps({
             "success": False,
-            "error": "This command is potentially destructive.",
+            "error": risk_reason,
             "action_required": "confirmation",
             "elicitation": {
                 "method": "elicitation/requestInput",
                 "params": {
-                    "message": f"Confirm execution of potentially destructive command: {command}",
+                    "message": f"{risk_reason}\nCommand: {command}",
                     "schema": {
                         "type": "object",
-                        "properties": {
-                            "confirm": {
-                                "type": "boolean",
-                                "description": "Confirm running the command"
-                            }
-                        },
+                        "properties": {"confirm": {"type": "boolean"}},
                         "required": ["confirm"]
                     }
                 }
@@ -319,10 +225,10 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     # For multiline commands, default to base64 injection to avoid quoting/newline issues
     effective_base64 = use_base64 or is_multiline
 
-    # Optionally change directory if provided and permitted by roots
+    # Optionally change directory
     if working_directory:
-        if not _is_path_within_roots(working_directory):
-            return json.dumps(_roots_error_payload(working_directory), indent=2)
+        safe_dir = str(Path(working_directory).expanduser().resolve())
+        await send_text_method(f"cd '{safe_dir}'\n")
 
     if is_multiline and preview:
         # Print a readable, non-interpreted preview to the terminal
@@ -330,11 +236,6 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         await send_text_method("cat <<'__MCP_PREVIEW__'\n")
         await send_text_method(f"{command}\n")
         await send_text_method("__MCP_PREVIEW__\n")
-
-    # If a working directory was specified, change into it first
-    if working_directory:
-        safe_dir = str(Path(working_directory).expanduser().resolve())
-        await send_text_method(f"cd '{safe_dir}'\n")
 
     if effective_base64:
         # Encode the command in base64 to prevent shell interpretation issues
@@ -628,9 +529,6 @@ async def write_file(file_path: str, content: str, require_confirmation: bool = 
     Pro-tip: For safer file modifications, use `git` commands to stage and commit
     changes, creating a safety net for your work.
 
-    Roots: The target `file_path` must reside within configured roots. Overwrites require
-    `require_confirmation=True`.
-
     Args:
         file_path (str): The absolute or relative path to the file.
         content (str): The content to write to the file.
@@ -640,13 +538,22 @@ async def write_file(file_path: str, content: str, require_confirmation: bool = 
     Returns:
         str: A JSON string confirming success or reporting an error.
     """
-    if not _is_path_within_roots(file_path):
-        return json.dumps(_roots_error_payload(file_path), indent=2)
-
     if os.path.exists(file_path) and not require_confirmation:
         return json.dumps({
             "success": False,
-            "error": f"File '{file_path}' already exists. Set `require_confirmation=True` to overwrite."
+            "error": f"File '{file_path}' already exists. Set `require_confirmation=True` to overwrite.",
+            "action_required": "confirmation",
+            "elicitation": {
+                "method": "elicitation/requestInput",
+                "params": {
+                    "message": f"Confirm overwriting existing file: {file_path}",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"confirm": {"type": "boolean"}},
+                        "required": ["confirm"]
+                    }
+                }
+            }
         }, indent=2)
 
     try:
@@ -669,7 +576,6 @@ async def read_file(file_path: str, start_line: Optional[int] = None, end_line: 
     Reads the contents of a file, optionally slicing by line numbers.
 
     Read-only: Prefer this over shell `cat`/`sed` via `run_command`.
-    Roots: The `file_path` must reside within configured roots.
 
     Args:
         file_path (str): The path to the file to read.
@@ -679,9 +585,6 @@ async def read_file(file_path: str, start_line: Optional[int] = None, end_line: 
     Returns:
         str: A JSON string with the file content or an error.
     """
-    if not _is_path_within_roots(file_path):
-        return json.dumps(_roots_error_payload(file_path), indent=2)
-
     try:
         with open(file_path, 'r') as f:
             lines = f.readlines()
@@ -712,7 +615,6 @@ async def list_directory(path: str, recursive: bool = False) -> str:
     Lists the contents of a directory in a structured format.
 
     Read-only: Returns metadata only.
-    Roots: `path` must be within configured roots.
 
     Args:
         path (str): The path to the directory to list.
@@ -721,9 +623,6 @@ async def list_directory(path: str, recursive: bool = False) -> str:
     Returns:
         str: A JSON string with a list of files and directories, or an error.
     """
-    if not _is_path_within_roots(path):
-        return json.dumps(_roots_error_payload(path), indent=2)
-
     try:
         if not os.path.isdir(path):
             return json.dumps({"success": False, "error": f"Not a directory: {path}"}, indent=2)
@@ -764,7 +663,6 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
     Pro-tip: For safer file modifications, use `git` commands to stage and commit
     changes, creating a safety net for your work.
 
-    Roots: The target `file_path` must be within configured roots.
     Destructive: Empty `new_content` deletes lines and requires `require_confirmation=True`.
 
     Args:
@@ -778,13 +676,22 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
     Returns:
         str: A JSON string confirming success or reporting an error.
     """
-    if not _is_path_within_roots(file_path):
-        return json.dumps(_roots_error_payload(file_path), indent=2)
-
     if not new_content and not require_confirmation:
         return json.dumps({
             "success": False,
-            "error": "Replacing content with an empty string will delete lines. Set `require_confirmation=True` to proceed."
+            "error": "Replacing content with an empty string will delete lines. Set `require_confirmation=True` to proceed.",
+            "action_required": "confirmation",
+            "elicitation": {
+                "method": "elicitation/requestInput",
+                "params": {
+                    "message": f"Confirm deleting lines {start_line}-{end_line} in {file_path}",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"confirm": {"type": "boolean"}},
+                        "required": ["confirm"]
+                    }
+                }
+            }
         }, indent=2)
 
     try:
@@ -830,7 +737,6 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
     Ripgrep must be installed on the system for this tool to function.
 
     Read-only: Returns match metadata without modifying files.
-    Roots: `path` must be within configured roots.
 
     Args:
         query (str): The string or regex pattern to search for.
@@ -840,9 +746,6 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
     Returns:
         str: A JSON string containing a list of search results or an error.
     """
-    if not _is_path_within_roots(path):
-        return json.dumps(_roots_error_payload(path), indent=2)
-
     try:
         # Find the ripgrep executable in a robust way
         rg_path = shutil.which("rg")
@@ -903,7 +806,6 @@ if __name__ == "__main__":
     print("Starting MCP server...", file=sys.stderr)
     try:
         # Initialize roots from environment before serving
-        _initialize_roots_from_env()
         mcp.run()
     except Exception as e:
         print(f"MCP server crashed: {e}", file=sys.stderr)
