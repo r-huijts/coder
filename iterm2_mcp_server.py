@@ -245,9 +245,14 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     """
     Runs a command in the active iTerm2 session.
 
-    Note: For writing content to files, please use the `write_file` tool instead of shell
-    commands like `echo`, `cat`, or `heredoc`. The `write_file` tool is more reliable
-    and the preferred method for file creation.
+    Best practice: Prefer specialized tools over shell when possible.
+      - File writes/overwrites → use `write_file` (safer, handles newlines/quoting, respects roots)
+      - In-place edits → use `edit_file` (surgical, avoids brittle sed/ed/perl)
+      - Reading files → use `read_file` (structured JSON, roots-enforced)
+      - Searching → use `search_code` (rg-powered, gitignore-aware)
+
+    Roots: If `working_directory` is provided, it must be within configured roots.
+    Dangerous commands (e.g., rm/dd/mkfs/shutdown/reboot) require `require_confirmation=True`.
 
     Pro-tip: For safer file modifications, use `git` commands to stage and commit
     changes, creating a safety net for your work.
@@ -393,6 +398,12 @@ async def send_text(text: str) -> str:
     """
     Sends a string of text to the active iTerm2 session without adding a newline.
 
+    Use cases:
+      - Interactive prompts, passwords (though avoid sending secrets when possible)
+      - Typing into REPLs or editors where newline should be controlled
+
+    Prefer `run_command` for executing full commands where a newline is desired.
+
     Args:
         text (str): The text to send to the terminal.
 
@@ -423,6 +434,9 @@ async def send_text(text: str) -> str:
 async def read_terminal_output(timeout: int = 5) -> str:
     """
     Reads the entire visible contents of the active iTerm2 session's screen.
+
+    Read-only: This tool is non-destructive and returns structured JSON.
+    Prefer this to scraping via `run_command` where possible.
 
     Args:
         timeout (int): The maximum time in seconds to wait for the screen contents. Defaults to 5.
@@ -484,6 +498,8 @@ async def clear_screen() -> str:
     
     This is equivalent to pressing Ctrl+L.
 
+    Read-only-ish: Does not modify files; affects terminal view only.
+
     Returns:
         str: A JSON string confirming the screen was cleared.
     """
@@ -510,6 +526,8 @@ async def clear_screen() -> str:
 async def list_profiles() -> str:
     """
     Retrieves a list of all available iTerm2 profiles.
+
+    Read-only: Returns profile names to guide selection. Combine with `switch_profile`.
 
     Returns:
         str: A JSON string containing a list of profile names.
@@ -542,6 +560,8 @@ async def switch_profile(profile: str) -> str:
 
     Returns:
         str: A JSON string confirming the profile switch.
+
+    Side effects: Changes terminal session settings. Non-file-destructive.
     """
     ctx = await connect_to_iterm2()
     if ctx["error"]:
@@ -574,6 +594,8 @@ async def get_session_info() -> str:
 
     Returns:
         str: A JSON string containing the window, tab, and session IDs.
+
+    Read-only: Useful for context and debugging; no side effects.
     """
     ctx = await connect_to_iterm2()
     if ctx["error"]:
@@ -605,6 +627,9 @@ async def write_file(file_path: str, content: str, require_confirmation: bool = 
 
     Pro-tip: For safer file modifications, use `git` commands to stage and commit
     changes, creating a safety net for your work.
+
+    Roots: The target `file_path` must reside within configured roots. Overwrites require
+    `require_confirmation=True`.
 
     Args:
         file_path (str): The absolute or relative path to the file.
@@ -642,6 +667,9 @@ async def write_file(file_path: str, content: str, require_confirmation: bool = 
 async def read_file(file_path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
     """
     Reads the contents of a file, optionally slicing by line numbers.
+
+    Read-only: Prefer this over shell `cat`/`sed` via `run_command`.
+    Roots: The `file_path` must reside within configured roots.
 
     Args:
         file_path (str): The path to the file to read.
@@ -682,6 +710,9 @@ async def read_file(file_path: str, start_line: Optional[int] = None, end_line: 
 async def list_directory(path: str, recursive: bool = False) -> str:
     """
     Lists the contents of a directory in a structured format.
+
+    Read-only: Returns metadata only.
+    Roots: `path` must be within configured roots.
 
     Args:
         path (str): The path to the directory to list.
@@ -732,6 +763,9 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
 
     Pro-tip: For safer file modifications, use `git` commands to stage and commit
     changes, creating a safety net for your work.
+
+    Roots: The target `file_path` must be within configured roots.
+    Destructive: Empty `new_content` deletes lines and requires `require_confirmation=True`.
 
     Args:
         file_path (str): The file to modify.
@@ -794,6 +828,9 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
 
     This tool leverages ripgrep (rg) for high-speed, gitignore-aware code searching.
     Ripgrep must be installed on the system for this tool to function.
+
+    Read-only: Returns match metadata without modifying files.
+    Roots: `path` must be within configured roots.
 
     Args:
         query (str): The string or regex pattern to search for.
