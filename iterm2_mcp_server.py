@@ -22,6 +22,51 @@ from mcp.server.fastmcp import FastMCP
 # Create the FastMCP server
 mcp = FastMCP("iTerm2")
 
+# =============================================================================
+# TOOL SELECTION PRIORITY GUIDE (CRITICAL FOR LLM TOOL CHOICE)
+# =============================================================================
+"""
+TOOL CHOICE RUBRIC - FOLLOW THIS ORDER:
+
+PRIORITY 1 - FILE I/O (ALWAYS PREFERRED FOR FILE OPERATIONS):
+  - Creating/writing files → write_file (NEVER use run_command with >, >>, tee)
+  - Reading files → read_file (NEVER use run_command with cat, less, head, tail)
+  - Editing specific lines → edit_file (NEVER use run_command with sed -i, ed, perl -i)
+
+PRIORITY 2 - STRUCTURED OPERATIONS:
+  - Directory listing → list_directory (NEVER use run_command with ls)
+  - Code searching → search_code (NEVER use run_command with grep, rg, ag)
+
+PRIORITY 3 - SECURITY/ROOTS:
+  - Managing filesystem access → list_roots, set_roots
+
+PRIORITY 4 - TERMINAL MANAGEMENT:
+  - Terminal setup → create_tab, create_session, switch_profile, list_profiles
+  - Session info → get_session_info, clear_screen
+
+PRIORITY 5 - TERMINAL I/O:
+  - Text input → send_text (for interactive prompts without newlines)
+  - Screen reading → read_terminal_output (for capturing current display)
+
+PRIORITY 6 - SHELL EXECUTION (LAST RESORT ONLY):
+  - run_command → ONLY for: package managers, builds, tests, system commands
+  - FORBIDDEN uses: file creation/modification, file reading, text processing
+
+REJECTION PATTERNS for run_command:
+  ❌ echo 'content' > file.txt        → USE: write_file
+  ❌ cat file.txt                     → USE: read_file
+  ❌ sed -i 's/a/b/' file.txt         → USE: edit_file
+  ❌ ls -la directory/                → USE: list_directory
+  ❌ grep "pattern" files             → USE: search_code
+  ❌ mkdir -p path && echo > path/f   → USE: write_file (creates parent dirs)
+
+APPROVED uses for run_command:
+  ✅ npm install, pip install, cargo build
+  ✅ git status, git commit, git push
+  ✅ python script.py, node app.js
+  ✅ systemctl status, ps aux, df -h
+"""
+
 
 # -----------------------------
 # Roots management and helpers
@@ -106,8 +151,12 @@ def _initialize_roots_from_env() -> None:
 @mcp.tool()
 async def list_roots() -> str:
     """
-    Lists currently configured filesystem roots that bound server operations.
-    If empty, operations are unrestricted (not recommended).
+    🔒 PRIORITY 3 - SECURITY ROOTS LISTER 🔒
+    
+    Shows allowed filesystem access boundaries for security.
+    
+    🎯 USE FOR: Checking current security restrictions.
+    READ-ONLY: Safe security boundary inspection.
     """
     return json.dumps({
         "success": True,
@@ -119,8 +168,12 @@ async def list_roots() -> str:
 @mcp.tool()
 async def set_roots(roots: list[str]) -> str:
     """
-    Sets the server's allowed filesystem roots. Values may be file:// URIs or paths.
-    Subsequent file operations must reside within these roots.
+    🔐 PRIORITY 3 - SECURITY ROOTS CONFIGURATOR 🔐
+    
+    Configures allowed filesystem access boundaries for security.
+    
+    🎯 USE FOR: Setting up secure file operation boundaries.
+    SECURITY: Restricts all file tools to specified directories.
     """
     global ALLOWED_ROOTS
     try:
@@ -165,7 +218,16 @@ async def connect_to_iterm2():
 @mcp.tool()
 async def create_tab(profile: Optional[str] = None) -> str:
     """
-    Creates a new tab in the current iTerm2 window.
+    🪟 PRIORITY 4 - NEW TAB CREATOR 🪟
+    
+    Creates a new iTerm2 tab for organizing terminal sessions.
+    
+    🎯 USE THIS TOOL FOR:
+    ✅ Setting up new development environments
+    ✅ Organizing different projects or tasks
+    ✅ Creating dedicated tabs for servers, logs, etc.
+    
+    TERMINAL-SPECIFIC: Creates new iTerm2 tab with optional profile.
 
     Args:
         profile (Optional[str]): The name of the profile to use for the new tab. 
@@ -205,7 +267,12 @@ async def create_tab(profile: Optional[str] = None) -> str:
 @mcp.tool()
 async def create_session(profile: Optional[str] = None) -> str:
     """
-    Creates a new session (split pane) in the current iTerm2 tab.
+    ⚡ PRIORITY 4 - SPLIT PANE CREATOR ⚡
+    
+    Creates a new session (split pane) in current tab for multitasking.
+    
+    🎯 USE FOR: Side-by-side terminal work, monitoring + coding.
+    TERMINAL-SPECIFIC: Creates split pane in current iTerm2 tab.
 
     Args:
         profile (Optional[str]): The name of the profile to use for the new session.
@@ -243,19 +310,32 @@ async def create_session(profile: Optional[str] = None) -> str:
 @mcp.tool()
 async def run_command(command: str, wait_for_output: bool = True, timeout: int = 10, require_confirmation: bool = False, use_base64: bool = False, preview: bool = True, working_directory: Optional[str] = None, isolate_output: bool = False) -> str:
     """
-    Runs a command in the active iTerm2 session.
-
-    Best practice: Prefer specialized tools over shell when possible.
-      - File writes/overwrites → use `write_file` (safer, handles newlines/quoting, respects roots)
-      - In-place edits → use `edit_file` (surgical, avoids brittle sed/ed/perl)
-      - Reading files → use `read_file` (structured JSON, roots-enforced)
-      - Searching → use `search_code` (rg-powered, gitignore-aware)
-
-    Roots: If `working_directory` is provided, it must be within configured roots.
-    Dangerous commands (e.g., rm/dd/mkfs/shutdown/reboot) require `require_confirmation=True`.
-
-    Pro-tip: For safer file modifications, use `git` commands to stage and commit
-    changes, creating a safety net for your work.
+    ⚠️  SHELL EXECUTION - USE AS LAST RESORT ONLY ⚠️
+    
+    Executes shell commands in iTerm2. HIGH RISK TOOL with significant limitations.
+    
+    🚫 FORBIDDEN USES (Use specialized tools instead):
+    ❌ File creation/writing: echo 'x' > file.txt → USE write_file
+    ❌ File reading: cat, head, tail, less → USE read_file  
+    ❌ File editing: sed -i, ed, perl -i → USE edit_file
+    ❌ Directory listing: ls, find → USE list_directory
+    ❌ Text searching: grep, rg, ag → USE search_code
+    ❌ File operations: mv, cp, rm → USE write_file/edit_file + confirmation
+    
+    ✅ APPROVED USES ONLY:
+    ✅ Package managers: npm install, pip install, cargo build, brew install
+    ✅ Version control: git status, git commit, git push, git pull
+    ✅ Process execution: python script.py, node app.js, ./configure, make
+    ✅ System inspection: ps aux, df -h, systemctl status, uname -a
+    ✅ Network tools: curl, wget, ping, ssh (non-file operations)
+    ✅ Build tools: make, cmake, gradlew, mvn compile
+    
+    SECURITY: Dangerous commands (rm, dd, mkfs, shutdown) require `require_confirmation=True`.
+    ROOTS: `working_directory` must be within configured roots.
+    
+    ⚠️  WARNING: This tool bypasses safety mechanisms of specialized file tools.
+    Prefer write_file/edit_file/read_file for ANY file operations - they are safer,
+    more reliable, handle edge cases better, and respect security boundaries.
 
     Args:
         command (str): The command to execute.
@@ -425,13 +505,23 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
 @mcp.tool()
 async def send_text(text: str) -> str:
     """
-    Sends a string of text to the active iTerm2 session without adding a newline.
-
-    Use cases:
-      - Interactive prompts, passwords (though avoid sending secrets when possible)
-      - Typing into REPLs or editors where newline should be controlled
-
-    Prefer `run_command` for executing full commands where a newline is desired.
+    ⌨️  PRIORITY 5 - RAW TEXT INPUT TOOL ⌨️
+    
+    Sends text to terminal WITHOUT adding newline. For interactive input only.
+    
+    🎯 USE THIS TOOL FOR:
+    ✅ Interactive prompts requiring user input
+    ✅ Typing into REPLs, editors, or interactive programs
+    ✅ Passwords or sensitive input (avoid when possible)
+    ✅ Partial command input where you control the newline
+    
+    🚫 DON'T USE FOR:
+    ❌ Executing complete commands → USE run_command
+    ❌ Writing files → USE write_file
+    ❌ Multi-line text → USE write_file or run_command
+    
+    TERMINAL-SPECIFIC: Sends raw keystrokes to current iTerm2 session.
+    NO NEWLINE: Text appears at cursor without executing.
 
     Args:
         text (str): The text to send to the terminal.
@@ -462,10 +552,24 @@ async def send_text(text: str) -> str:
 @mcp.tool()
 async def read_terminal_output(timeout: int = 5) -> str:
     """
-    Reads the entire visible contents of the active iTerm2 session's screen.
-
-    Read-only: This tool is non-destructive and returns structured JSON.
-    Prefer this to scraping via `run_command` where possible.
+    📺 PRIORITY 5 - TERMINAL SCREEN READER 📺
+    
+    Captures the current visible terminal screen contents. Use for reading
+    current terminal state, not for file operations.
+    
+    🎯 USE THIS TOOL FOR:
+    ✅ Reading current terminal display/output
+    ✅ Capturing command results that are already visible
+    ✅ Debugging terminal state or checking current directory
+    ✅ Reading interactive program output (REPLs, editors)
+    
+    🚫 DON'T USE FOR FILE OPERATIONS:
+    ❌ Reading file contents → USE read_file
+    ❌ Capturing command output → USE run_command with wait_for_output=True
+    ❌ Getting directory listings → USE list_directory
+    
+    READ-ONLY: This tool never modifies anything - completely safe.
+    TERMINAL-SPECIFIC: Only works with current iTerm2 session screen.
 
     Args:
         timeout (int): The maximum time in seconds to wait for the screen contents. Defaults to 5.
@@ -523,11 +627,12 @@ async def read_terminal_output(timeout: int = 5) -> str:
 @mcp.tool()
 async def clear_screen() -> str:
     """
-    Clears the screen of the active iTerm2 session.
+    🧹 PRIORITY 4 - SCREEN CLEANER 🧹
     
-    This is equivalent to pressing Ctrl+L.
-
-    Read-only-ish: Does not modify files; affects terminal view only.
+    Clears terminal screen (equivalent to Ctrl+L).
+    
+    🎯 USE FOR: Cleaning cluttered terminal display.
+    TERMINAL-SPECIFIC: Clears current iTerm2 session screen only.
 
     Returns:
         str: A JSON string confirming the screen was cleared.
@@ -554,9 +659,12 @@ async def clear_screen() -> str:
 @mcp.tool()
 async def list_profiles() -> str:
     """
-    Retrieves a list of all available iTerm2 profiles.
-
-    Read-only: Returns profile names to guide selection. Combine with `switch_profile`.
+    📋 PRIORITY 4 - PROFILE LISTER 📋
+    
+    Lists available iTerm2 profiles for theme/config selection.
+    
+    🎯 USE FOR: Discovering available terminal profiles.
+    READ-ONLY: Safe profile enumeration.
 
     Returns:
         str: A JSON string containing a list of profile names.
@@ -582,15 +690,18 @@ async def list_profiles() -> str:
 @mcp.tool()
 async def switch_profile(profile: str) -> str:
     """
-    Switches the profile of the current iTerm2 session.
+    🎨 PRIORITY 4 - PROFILE SWITCHER 🎨
+    
+    Switches iTerm2 profile (theme, colors, settings).
+    
+    🎯 USE FOR: Changing terminal appearance/behavior.
+    TERMINAL-SPECIFIC: Affects current session only.
 
     Args:
         profile (str): The name of the profile to switch to.
 
     Returns:
         str: A JSON string confirming the profile switch.
-
-    Side effects: Changes terminal session settings. Non-file-destructive.
     """
     ctx = await connect_to_iterm2()
     if ctx["error"]:
@@ -619,12 +730,15 @@ async def switch_profile(profile: str) -> str:
 @mcp.tool()
 async def get_session_info() -> str:
     """
-    Gets information about the current iTerm2 window, tab, and session.
+    ℹ️  PRIORITY 4 - SESSION INFO ℹ️
+    
+    Gets current iTerm2 window/tab/session IDs for debugging.
+    
+    🎯 USE FOR: Terminal context and debugging.
+    READ-ONLY: Safe information retrieval.
 
     Returns:
         str: A JSON string containing the window, tab, and session IDs.
-
-    Read-only: Useful for context and debugging; no side effects.
     """
     ctx = await connect_to_iterm2()
     if ctx["error"]:
@@ -648,17 +762,34 @@ async def get_session_info() -> str:
 @mcp.tool()
 async def write_file(file_path: str, content: str, require_confirmation: bool = False) -> str:
     """
-    Writes content to a specified file on the local filesystem.
-
-    This is the **preferred** and most reliable method for creating or overwriting files.
-    It uses standard Python file I/O and should be used instead of shell
-    commands like 'echo' or 'heredoc' via the `run_command` tool.
-
-    Pro-tip: For safer file modifications, use `git` commands to stage and commit
-    changes, creating a safety net for your work.
-
-    Roots: The target `file_path` must reside within configured roots. Overwrites require
-    `require_confirmation=True`.
+    🏆 PRIORITY 1 - FILE CREATION/WRITING TOOL 🏆
+    
+    The ONLY correct tool for creating or overwriting files. NEVER use run_command
+    for file writing operations.
+    
+    🎯 USE THIS TOOL FOR:
+    ✅ Creating new files: any file type (.py, .js, .txt, .md, .json, etc.)
+    ✅ Overwriting entire files with new content
+    ✅ Writing multi-line content with proper newline handling
+    ✅ Writing content with special characters, quotes, or shell metacharacters
+    ✅ Creating files in nested directories (automatically creates parent dirs)
+    
+    🚫 NEVER USE run_command FOR:
+    ❌ echo 'content' > file.txt
+    ❌ cat << EOF > file.txt  
+    ❌ printf 'data' > file.txt
+    ❌ tee file.txt <<< 'content'
+    ❌ python -c "open('file','w').write('data')"
+    
+    ADVANTAGES over shell redirection:
+    • Handles newlines, quotes, and special characters correctly
+    • Respects configured filesystem roots for security
+    • Atomic write operations prevent partial file corruption
+    • Proper error handling with structured JSON responses
+    • No shell injection vulnerabilities
+    
+    ROOTS: Target `file_path` must be within configured roots.
+    SAFETY: Overwrites require `require_confirmation=True`.
 
     Args:
         file_path (str): The absolute or relative path to the file.
@@ -695,10 +826,34 @@ async def write_file(file_path: str, content: str, require_confirmation: bool = 
 @mcp.tool()
 async def read_file(file_path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
     """
-    Reads the contents of a file, optionally slicing by line numbers.
-
-    Read-only: Prefer this over shell `cat`/`sed` via `run_command`.
-    Roots: The `file_path` must reside within configured roots.
+    🏆 PRIORITY 1 - FILE READING TOOL 🏆
+    
+    The ONLY correct tool for reading file contents. NEVER use run_command
+    for file reading operations.
+    
+    🎯 USE THIS TOOL FOR:
+    ✅ Reading entire files: any file type (.py, .js, .txt, .md, .json, logs, etc.)
+    ✅ Reading specific line ranges: start_line and end_line parameters
+    ✅ Reading files with special characters, unicode, or binary content
+    ✅ Safe file access with proper error handling
+    
+    🚫 NEVER USE run_command FOR:
+    ❌ cat file.txt
+    ❌ head -n 20 file.txt  
+    ❌ tail -n 10 file.txt
+    ❌ less file.txt
+    ❌ more file.txt
+    ❌ sed -n '1,10p' file.txt
+    
+    ADVANTAGES over shell commands:
+    • Returns structured JSON with proper error handling
+    • Respects configured filesystem roots for security
+    • Handles unicode and special characters correctly
+    • Optional line slicing without external tools
+    • No output formatting issues or terminal paging
+    
+    READ-ONLY: This tool never modifies files - completely safe.
+    ROOTS: `file_path` must be within configured roots.
 
     Args:
         file_path (str): The path to the file to read.
@@ -738,10 +893,34 @@ async def read_file(file_path: str, start_line: Optional[int] = None, end_line: 
 @mcp.tool()
 async def list_directory(path: str, recursive: bool = False) -> str:
     """
-    Lists the contents of a directory in a structured format.
-
-    Read-only: Returns metadata only.
-    Roots: `path` must be within configured roots.
+    📁 PRIORITY 2 - DIRECTORY LISTING TOOL 📁
+    
+    The ONLY correct tool for listing directory contents. NEVER use run_command
+    for directory listing operations.
+    
+    🎯 USE THIS TOOL FOR:
+    ✅ Listing files and directories in structured format
+    ✅ Recursive directory traversal with recursive=True
+    ✅ Getting file/directory metadata and paths
+    ✅ Exploring project structure safely
+    
+    🚫 NEVER USE run_command FOR:
+    ❌ ls -la directory/
+    ❌ find directory/ -type f
+    ❌ tree directory/
+    ❌ ls -R directory/
+    ❌ find . -name "*.py"
+    
+    ADVANTAGES over shell commands:
+    • Returns structured JSON with file/directory distinction
+    • Handles filenames with spaces, special characters, unicode
+    • Optional recursive traversal without complex find commands
+    • Consistent cross-platform behavior
+    • Respects configured filesystem roots for security
+    • No output parsing or formatting issues
+    
+    READ-ONLY: This tool never modifies the filesystem - completely safe.
+    ROOTS: `path` must be within configured roots.
 
     Args:
         path (str): The path to the directory to list.
@@ -787,16 +966,36 @@ async def list_directory(path: str, recursive: bool = False) -> str:
 @mcp.tool()
 async def edit_file(file_path: str, start_line: int, end_line: int, new_content: str, require_confirmation: bool = False) -> str:
     """
-    Replaces a specific block of lines in a file with new content.
-
-    Use this tool for targeted modifications of existing files. For creating new files
-    or completely overwriting existing files, use the `write_file` tool.
-
-    Pro-tip: For safer file modifications, use `git` commands to stage and commit
-    changes, creating a safety net for your work.
-
-    Roots: The target `file_path` must be within configured roots.
-    Destructive: Empty `new_content` deletes lines and requires `require_confirmation=True`.
+    🏆 PRIORITY 1 - SURGICAL FILE EDITING TOOL 🏆
+    
+    The ONLY correct tool for modifying specific lines in files. NEVER use run_command
+    for in-place file editing operations.
+    
+    🎯 USE THIS TOOL FOR:
+    ✅ Replacing specific line ranges in existing files
+    ✅ Inserting content at specific positions
+    ✅ Deleting specific lines (with empty new_content)
+    ✅ Precise code modifications without affecting other lines
+    ✅ Safe surgical edits with line-number precision
+    
+    🚫 NEVER USE run_command FOR:
+    ❌ sed -i 's/old/new/g' file.txt
+    ❌ perl -i -pe 's/pattern/replacement/' file.txt
+    ❌ ed file.txt (with ed commands)
+    ❌ awk -i inplace '{gsub(/old/,new)}1' file.txt
+    ❌ python -c "edit file in place"
+    
+    ADVANTAGES over shell editing:
+    • Precise line-based modifications without regex complexity
+    • No risk of unintended global replacements
+    • Preserves file encoding and line endings
+    • Atomic operations prevent partial corruption
+    • Respects configured filesystem roots for security
+    • Clear error messages for out-of-range line numbers
+    
+    WORKFLOW: Use read_file first to see current content and determine line ranges.
+    SAFETY: Empty `new_content` deletes lines, requires `require_confirmation=True`.
+    ROOTS: `file_path` must be within configured roots.
 
     Args:
         file_path (str): The file to modify.
@@ -855,13 +1054,36 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
 @mcp.tool()
 async def search_code(query: str, path: str = ".", case_sensitive: bool = True) -> str:
     """
-    Searches for a string in files using ripgrep and returns structured results.
-
-    This tool leverages ripgrep (rg) for high-speed, gitignore-aware code searching.
-    Ripgrep must be installed on the system for this tool to function.
-
-    Read-only: Returns match metadata without modifying files.
-    Roots: `path` must be within configured roots.
+    🔍 PRIORITY 2 - CODE SEARCH TOOL 🔍
+    
+    The ONLY correct tool for searching text in files. NEVER use run_command
+    for text search operations.
+    
+    🎯 USE THIS TOOL FOR:
+    ✅ Finding text/patterns across multiple files
+    ✅ Locating function definitions, variable usage, imports
+    ✅ Searching with regex patterns
+    ✅ Case-sensitive or case-insensitive searches
+    ✅ Fast, gitignore-aware searching with ripgrep
+    
+    🚫 NEVER USE run_command FOR:
+    ❌ grep -r "pattern" directory/
+    ❌ find . -name "*.py" -exec grep "pattern" {} \;
+    ❌ rg "pattern" files/
+    ❌ ag "pattern" directory/
+    ❌ ack "pattern" 
+    
+    ADVANTAGES over shell search:
+    • Returns structured JSON with file paths, line numbers, and content
+    • Gitignore-aware (skips .git, node_modules, build artifacts automatically)
+    • Extremely fast ripgrep-powered search engine
+    • Proper error handling and search result organization
+    • Respects configured filesystem roots for security
+    • No output parsing issues or formatting problems
+    
+    READ-ONLY: This tool never modifies files - completely safe for exploration.
+    ROOTS: `path` must be within configured roots.
+    REQUIREMENT: Ripgrep (rg) must be installed on the system.
 
     Args:
         query (str): The string or regex pattern to search for.
