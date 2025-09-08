@@ -7,13 +7,11 @@ A Model Context Protocol server for controlling iTerm2
 import json
 import asyncio
 import os
-import subprocess
 import sys
-import functools
 import shutil
 from typing import Optional
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+ 
 
 import iterm2
 from mcp.server.fastmcp import FastMCP
@@ -36,9 +34,6 @@ PRIORITY 1 - FILE I/O (ALWAYS PREFERRED FOR FILE OPERATIONS):
 PRIORITY 2 - STRUCTURED OPERATIONS:
   - Directory listing → list_directory (NEVER use run_command with ls)
   - Code searching → search_code (NEVER use run_command with grep, rg, ag)
-
-PRIORITY 3 - SECURITY/ROOTS:
-  - Managing filesystem access → list_roots, set_roots
 
 PRIORITY 4 - TERMINAL MANAGEMENT:
   - Terminal setup → create_tab, create_session, switch_profile, list_profiles
@@ -68,129 +63,10 @@ APPROVED uses for run_command:
 """
 
 
-# -----------------------------
-# Roots management and helpers
-# -----------------------------
-ALLOWED_ROOTS: list[Path] = []
-
-def _parse_file_uri_or_path(value: str) -> Path:
-    """
-    Accepts either a file:// URI or a filesystem path and returns a resolved Path.
-    """
-    parsed = urlparse(value)
-    if parsed.scheme and parsed.scheme != "file":
-        raise ValueError(f"Unsupported URI scheme for roots: {parsed.scheme}")
-    if parsed.scheme == "file":
-        raw_path = unquote(parsed.path)
-    else:
-        raw_path = value
-    path = Path(raw_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Root path does not exist: {path}")
-    if not path.is_dir():
-        raise NotADirectoryError(f"Root is not a directory: {path}")
-    return path
-
-def _is_path_within_roots(target_path: str | Path) -> bool:
-    """
-    Returns True if roots are empty (unrestricted) or if the path is within any allowed root.
-    """
-    try:
-        path_obj = Path(target_path).expanduser().resolve()
-    except Exception:
-        return False
-    if not ALLOWED_ROOTS:
-        return True
-    for root in ALLOWED_ROOTS:
-        try:
-            path_obj.relative_to(root)
-            return True
-        except ValueError:
-            continue
-    return False
-
-def _roots_error_payload(path: str) -> dict:
-    return {
-        "success": False,
-        "error": f"Access to '{path}' is outside configured roots. Set roots via set_roots or adjust the path.",
-        "roots": [str(p) for p in ALLOWED_ROOTS],
-    }
+ 
 
 
-def _initialize_roots_from_env() -> None:
-    """
-    Initializes ALLOWED_ROOTS from environment variables if present.
-    Supported variables:
-      - MCP_ROOTS_JSON: JSON array of file:// URIs or paths
-      - MCP_ROOTS: Comma-separated list of file:// URIs or paths
-    """
-    global ALLOWED_ROOTS
-    roots_json = os.getenv("MCP_ROOTS_JSON")
-    roots_csv = os.getenv("MCP_ROOTS") or os.getenv("ALLOWED_ROOTS")
-    values: list[str] = []
-    try:
-        if roots_json:
-            parsed = json.loads(roots_json)
-            if isinstance(parsed, list):
-                values = [str(x) for x in parsed]
-        elif roots_csv:
-            values = [v.strip() for v in roots_csv.split(",") if v.strip()]
-
-        if values:
-            parsed_roots = [_parse_file_uri_or_path(v) for v in values]
-            unique: list[Path] = []
-            for p in parsed_roots:
-                if p not in unique:
-                    unique.append(p)
-            ALLOWED_ROOTS = unique
-            print(f"[MCP] Configured {len(ALLOWED_ROOTS)} root(s) from environment.", file=sys.stderr)
-    except Exception as e:
-        print(f"[MCP] Failed to configure roots from environment: {e}", file=sys.stderr)
-
-
-@mcp.tool()
-async def list_roots() -> str:
-    """
-    🔒 PRIORITY 3 - SECURITY ROOTS LISTER 🔒
-    
-    Shows allowed filesystem access boundaries for security.
-    
-    🎯 USE FOR: Checking current security restrictions.
-    READ-ONLY: Safe security boundary inspection.
-    """
-    return json.dumps({
-        "success": True,
-        "roots": [str(p) for p in ALLOWED_ROOTS],
-        "unrestricted": len(ALLOWED_ROOTS) == 0
-    }, indent=2)
-
-
-@mcp.tool()
-async def set_roots(roots: list[str]) -> str:
-    """
-    🔐 PRIORITY 3 - SECURITY ROOTS CONFIGURATOR 🔐
-    
-    Configures allowed filesystem access boundaries for security.
-    
-    🎯 USE FOR: Setting up secure file operation boundaries.
-    SECURITY: Restricts all file tools to specified directories.
-    """
-    global ALLOWED_ROOTS
-    try:
-        parsed_roots = [_parse_file_uri_or_path(r) for r in roots]
-        # Deduplicate and sort for stability
-        unique: list[Path] = []
-        for p in parsed_roots:
-            if p not in unique:
-                unique.append(p)
-        ALLOWED_ROOTS = unique
-        return json.dumps({
-            "success": True,
-            "roots": [str(p) for p in ALLOWED_ROOTS],
-            "message": f"Configured {len(ALLOWED_ROOTS)} root(s)"
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)}, indent=2)
+ 
 
 async def connect_to_iterm2():
     """
@@ -331,7 +207,6 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     ✅ Build tools: make, cmake, gradlew, mvn compile
     
     SECURITY: Dangerous commands (rm, dd, mkfs, shutdown) require `require_confirmation=True`.
-    ROOTS: `working_directory` must be within configured roots.
     
     ⚠️  WARNING: This tool bypasses safety mechanisms of specialized file tools.
     Prefer write_file/edit_file/read_file for ANY file operations - they are safer,
@@ -401,10 +276,8 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     # For multiline commands, default to base64 injection to avoid quoting/newline issues
     effective_base64 = use_base64 or is_multiline
 
-    # Optionally change directory if provided and permitted by roots
+    # Optionally change directory if provided
     if working_directory:
-        if not _is_path_within_roots(working_directory):
-            return json.dumps(_roots_error_payload(working_directory), indent=2)
 
     if is_multiline and preview:
         # Print a readable, non-interpreted preview to the terminal
@@ -783,12 +656,10 @@ async def write_file(file_path: str, content: str, require_confirmation: bool = 
     
     ADVANTAGES over shell redirection:
     • Handles newlines, quotes, and special characters correctly
-    • Respects configured filesystem roots for security
     • Atomic write operations prevent partial file corruption
     • Proper error handling with structured JSON responses
     • No shell injection vulnerabilities
     
-    ROOTS: Target `file_path` must be within configured roots.
     SAFETY: Overwrites require `require_confirmation=True`.
 
     Args:
@@ -800,8 +671,7 @@ async def write_file(file_path: str, content: str, require_confirmation: bool = 
     Returns:
         str: A JSON string confirming success or reporting an error.
     """
-    if not _is_path_within_roots(file_path):
-        return json.dumps(_roots_error_payload(file_path), indent=2)
+    
 
     if os.path.exists(file_path) and not require_confirmation:
         return json.dumps({
@@ -847,13 +717,11 @@ async def read_file(file_path: str, start_line: Optional[int] = None, end_line: 
     
     ADVANTAGES over shell commands:
     • Returns structured JSON with proper error handling
-    • Respects configured filesystem roots for security
     • Handles unicode and special characters correctly
     • Optional line slicing without external tools
     • No output formatting issues or terminal paging
     
     READ-ONLY: This tool never modifies files - completely safe.
-    ROOTS: `file_path` must be within configured roots.
 
     Args:
         file_path (str): The path to the file to read.
@@ -863,8 +731,7 @@ async def read_file(file_path: str, start_line: Optional[int] = None, end_line: 
     Returns:
         str: A JSON string with the file content or an error.
     """
-    if not _is_path_within_roots(file_path):
-        return json.dumps(_roots_error_payload(file_path), indent=2)
+    
 
     try:
         with open(file_path, 'r') as f:
@@ -916,11 +783,9 @@ async def list_directory(path: str, recursive: bool = False) -> str:
     • Handles filenames with spaces, special characters, unicode
     • Optional recursive traversal without complex find commands
     • Consistent cross-platform behavior
-    • Respects configured filesystem roots for security
     • No output parsing or formatting issues
     
     READ-ONLY: This tool never modifies the filesystem - completely safe.
-    ROOTS: `path` must be within configured roots.
 
     Args:
         path (str): The path to the directory to list.
@@ -929,8 +794,7 @@ async def list_directory(path: str, recursive: bool = False) -> str:
     Returns:
         str: A JSON string with a list of files and directories, or an error.
     """
-    if not _is_path_within_roots(path):
-        return json.dumps(_roots_error_payload(path), indent=2)
+    
 
     try:
         # Expand '~' and resolve symlinks for accurate checks
@@ -990,12 +854,10 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
     • No risk of unintended global replacements
     • Preserves file encoding and line endings
     • Atomic operations prevent partial corruption
-    • Respects configured filesystem roots for security
     • Clear error messages for out-of-range line numbers
     
     WORKFLOW: Use read_file first to see current content and determine line ranges.
     SAFETY: Empty `new_content` deletes lines, requires `require_confirmation=True`.
-    ROOTS: `file_path` must be within configured roots.
 
     Args:
         file_path (str): The file to modify.
@@ -1008,8 +870,7 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
     Returns:
         str: A JSON string confirming success or reporting an error.
     """
-    if not _is_path_within_roots(file_path):
-        return json.dumps(_roots_error_payload(file_path), indent=2)
+    
 
     if not new_content and not require_confirmation:
         return json.dumps({
@@ -1078,11 +939,9 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
     • Gitignore-aware (skips .git, node_modules, build artifacts automatically)
     • Extremely fast ripgrep-powered search engine
     • Proper error handling and search result organization
-    • Respects configured filesystem roots for security
     • No output parsing issues or formatting problems
     
     READ-ONLY: This tool never modifies files - completely safe for exploration.
-    ROOTS: `path` must be within configured roots.
     REQUIREMENT: Ripgrep (rg) must be installed on the system.
 
     Args:
@@ -1093,8 +952,7 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
     Returns:
         str: A JSON string containing a list of search results or an error.
     """
-    if not _is_path_within_roots(path):
-        return json.dumps(_roots_error_payload(path), indent=2)
+    
 
     try:
         # Find the ripgrep executable in a robust way
@@ -1155,8 +1013,6 @@ if __name__ == "__main__":
     # Run the FastMCP server
     print("Starting MCP server...", file=sys.stderr)
     try:
-        # Initialize roots from environment before serving
-        _initialize_roots_from_env()
         mcp.run()
     except Exception as e:
         print(f"MCP server crashed: {e}", file=sys.stderr)
