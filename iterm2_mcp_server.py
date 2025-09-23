@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-iTerm2 MCP Server using FastMCP
-A Model Context Protocol server for controlling iTerm2
+iTerm2 MCP Server using FastMCP - Memory Optimized Version
+A Model Context Protocol server for controlling iTerm2 with better memory management
 """
 
 import json
@@ -9,13 +9,14 @@ import asyncio
 import os
 import sys
 import shutil
-from typing import Optional
+import weakref
+import gc
+from typing import Optional, Dict, Any
 from pathlib import Path
- 
+from datetime import datetime
 
 import iterm2
 from mcp.server.fastmcp import FastMCP
-
 
 # Create the FastMCP server
 mcp = FastMCP("iTerm2")
@@ -23,6 +24,7 @@ mcp = FastMCP("iTerm2")
 # =============================================================================
 # TOOL SELECTION PRIORITY GUIDE (CRITICAL FOR LLM TOOL CHOICE)
 # =============================================================================
+
 """
 TOOL CHOICE RUBRIC - FOLLOW THIS ORDER:
 
@@ -62,39 +64,99 @@ APPROVED uses for run_command:
   ✅ systemctl status, ps aux, df -h
 """
 
+# =============================================================================
+# CONNECTION POOLING & MEMORY MANAGEMENT
+# =============================================================================
 
- 
-
-
- 
-
-async def connect_to_iterm2():
-    """
-    Creates an iTerm2 connection and returns a context dictionary.
-    """
-    try:
-        connection = await iterm2.Connection.async_create()
-        app = await iterm2.async_get_app(connection)
-        window = app.current_window
-        tab = window.current_tab if window else None
-        session = tab.current_session if tab else None
+class iTerm2ConnectionManager:
+    """Manages iTerm2 connections with memory optimization"""
+    
+    def __init__(self):
+        self._connection = None
+        self._last_used = None
+        self._connection_timeout = 300  # 5 minutes
         
-        return {
-            "connection": connection,
-            "app": app,
-            "window": window,
-            "tab": tab,
-            "session": session,
-            "error": None
-        }
-    except Exception as e:
-        return {"error": f"iTerm2 connection failed: {str(e)}"}
+    async def get_connection(self):
+        """Get or create a reusable iTerm2 connection"""
+        now = datetime.now()
+        
+        # Check if we need a new connection
+        if (self._connection is None or 
+            self._last_used is None or 
+            (now - self._last_used).seconds > self._connection_timeout):
+            
+            # Clean up old connection
+            if self._connection:
+                try:
+                    await self._connection.async_close()
+                except:
+                    pass
+                self._connection = None
+            
+            # Create new connection
+            try:
+                self._connection = await iterm2.Connection.async_create()
+                self._last_used = now
+            except Exception as e:
+                return {"error": f"iTerm2 connection failed: {str(e)}"}
+        
+        self._last_used = now
+        
+        try:
+            app = await iterm2.async_get_app(self._connection)
+            window = app.current_window
+            tab = window.current_tab if window else None
+            session = tab.current_session if tab else None
+            
+            return {
+                "connection": self._connection,
+                "app": app,
+                "window": window,
+                "tab": tab,
+                "session": session,
+                "error": None
+            }
+        except Exception as e:
+            return {"error": f"iTerm2 context retrieval failed: {str(e)}"}
+    
+    async def cleanup(self):
+        """Explicit cleanup for connection"""
+        if self._connection:
+            try:
+                await self._connection.async_close()
+            except:
+                pass
+            self._connection = None
+        gc.collect()  # Force garbage collection
 
+# Global connection manager
+connection_manager = iTerm2ConnectionManager()
+
+def optimize_json_response(data: Dict[Any, Any], max_output_size: int = 10000) -> str:
+    """Create memory-efficient JSON responses"""
+    
+    # Truncate large outputs
+    if "output" in data and isinstance(data["output"], str):
+        output_len = len(data["output"])
+        if output_len > max_output_size:
+            data["output"] = data["output"][:max_output_size] + f"... (truncated {output_len - max_output_size} chars)"
+            data["output_truncated"] = True
+            data["original_length"] = output_len
+    
+    # Use compact JSON for large responses
+    if len(str(data)) > 5000:
+        return json.dumps(data, separators=(',', ':'))
+    else:
+        return json.dumps(data, indent=2)
+
+# =============================================================================
+# OPTIMIZED CORE TOOLS
+# =============================================================================
 
 @mcp.tool()
 async def create_tab(profile: Optional[str] = None) -> str:
     """
-    🪟 PRIORITY 4 - NEW TAB CREATOR 🪟
+    🛸 PRIORITY 4 - NEW TAB CREATOR 🛸
     
     Creates a new iTerm2 tab for organizing terminal sessions.
     
@@ -112,9 +174,9 @@ async def create_tab(profile: Optional[str] = None) -> str:
     Returns:
         str: A JSON string containing the new window, tab, and session IDs.
     """
-    ctx = await connect_to_iterm2()
-    if ctx["error"]:
-        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+    ctx = await connection_manager.get_connection()
+    if ctx.get("error"):
+        return optimize_json_response({"success": False, "error": ctx["error"]})
 
     connection = ctx["connection"]
     if profile:
@@ -137,7 +199,7 @@ async def create_tab(profile: Optional[str] = None) -> str:
         "message": f"Created new tab with session {session.session_id}"
     }
     
-    return json.dumps(result, indent=2)
+    return optimize_json_response(result)
 
 
 @mcp.tool()
@@ -157,13 +219,13 @@ async def create_session(profile: Optional[str] = None) -> str:
     Returns:
         str: A JSON string containing the new session ID.
     """
-    ctx = await connect_to_iterm2()
-    if ctx["error"]:
-        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+    ctx = await connection_manager.get_connection()
+    if ctx.get("error"):
+        return optimize_json_response({"success": False, "error": ctx["error"]})
 
     connection, tab = ctx["connection"], ctx["tab"]
     if not tab:
-        return json.dumps({"success": False, "error": "No active iTerm2 tab found."}, indent=2)
+        return optimize_json_response({"success": False, "error": "No active iTerm2 tab found."})
 
     if profile:
         profile_obj = await iterm2.Profile.async_get(connection, [profile])
@@ -180,11 +242,14 @@ async def create_session(profile: Optional[str] = None) -> str:
         "message": f"Created new session {session.session_id}"
     }
     
-    return json.dumps(result, indent=2)
+    return optimize_json_response(result)
 
 
 @mcp.tool()
-async def run_command(command: str, wait_for_output: bool = True, timeout: int = 10, require_confirmation: bool = False, use_base64: bool = False, preview: bool = True, working_directory: Optional[str] = None, isolate_output: bool = False) -> str:
+async def run_command(command: str, wait_for_output: bool = True, timeout: int = 10, 
+                      require_confirmation: bool = False, use_base64: bool = False, 
+                      preview: bool = True, working_directory: Optional[str] = None, 
+                      isolate_output: bool = False, max_output_chars: int = 10000) -> str:
     """
     ⚠️  SHELL EXECUTION - USE AS LAST RESORT ONLY ⚠️
     
@@ -207,6 +272,7 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     ✅ Build tools: make, cmake, gradlew, mvn compile
     
     SECURITY: Dangerous commands (rm, dd, mkfs, shutdown) require `require_confirmation=True`.
+    MEMORY: Output size limited to prevent memory issues during long tasks.
     
     ⚠️  WARNING: This tool bypasses safety mechanisms of specialized file tools.
     Prefer write_file/edit_file/read_file for ANY file operations - they are safer,
@@ -225,18 +291,19 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
                         using a safe heredoc before execution. Defaults to True.
         isolate_output (bool): If True, wraps execution with unique begin/end markers and
                                extracts only that region from the captured screen output.
+        max_output_chars (int): Maximum output size to prevent memory issues.
 
     Returns:
         str: A JSON string containing the execution status and output if captured.
     """
-    ctx = await connect_to_iterm2()
-    if ctx["error"]:
-        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+    ctx = await connection_manager.get_connection()
+    if ctx.get("error"):
+        return optimize_json_response({"success": False, "error": ctx["error"]})
 
     DANGEROUS_COMMANDS = ["rm ", "dd ", "mkfs ", "shutdown ", "reboot "]
     if any(cmd in command for cmd in DANGEROUS_COMMANDS) and not require_confirmation:
         # Provide an elicitation-style payload for compatible clients
-        return json.dumps({
+        return optimize_json_response({
             "success": False,
             "error": "This command is potentially destructive.",
             "action_required": "confirmation",
@@ -257,27 +324,26 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
                 }
             },
             "hint": "Re-run with require_confirmation=True to proceed."
-        }, indent=2)
+        })
 
     session = ctx["session"]
     if not session:
-        return json.dumps({"success": False, "error": "No active iTerm2 session found."}, indent=2)
+        return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
     # Choose how to inject the command
     send_text_method = getattr(session, "async_send_text", None) or getattr(session, "async_inject_text", None)
     if send_text_method is None:
-        return json.dumps({
+        return optimize_json_response({
             "success": False,
             "error": "Neither async_send_text nor async_inject_text is available on this iTerm2 Session."
-        }, indent=2)
+        })
 
     is_multiline = "\n" in command
 
     # For multiline commands, default to base64 injection to avoid quoting/newline issues
     effective_base64 = use_base64 or is_multiline
 
-    # Optionally change directory if provided
-    if working_directory:
+    # Optionally change directory preview if provided
 
     if is_multiline and preview:
         # Print a readable, non-interpreted preview to the terminal
@@ -317,30 +383,34 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         "success": True,
         "command": command,
         "session_id": session.session_id,
-        "message": f"Executed command: {command}"
+        "message": f"Executed command: {command}",
+        "timestamp": datetime.now().isoformat()
     }
     
-    # If requested, wait for and read output
+    # If requested, wait for and read output (with memory limits)
     if wait_for_output:
         try:
             # Wait a bit for the command to start
             await asyncio.sleep(0.5)
             
             # Read the output with timeout
-            output = await asyncio.wait_for(
+            screen = await asyncio.wait_for(
                 session.async_get_screen_contents(),
                 timeout=timeout
             )
             
-            # Get the current screen contents
-            screen = await session.async_get_screen_contents()
             if screen:
-                # Extract the text content using the correct API
+                # Extract the text content using the correct API with limits
                 output_text = ""
-                for i in range(screen.number_of_lines):
+                lines_processed = 0
+                max_lines = 200  # Limit lines to prevent memory bloat
+                
+                for i in range(min(screen.number_of_lines, max_lines)):
                     line = screen.line(i)
                     if line.string:
                         output_text += line.string + "\n"
+                        lines_processed += 1
+                        
                 # If requested, extract only marked region
                 if isolate_output:
                     # Find begin/end markers on line boundaries
@@ -354,11 +424,22 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
                             break
                     if begin_idx is not None and end_idx is not None and end_idx >= begin_idx:
                         output_text = "\n".join(lines[begin_idx:end_idx]) + "\n"
-                    # else: leave full screen text as fallback
+
+                # Truncate if too large
+                if len(output_text) > max_output_chars:
+                    output_text = output_text[:max_output_chars]
+                    result["output_truncated"] = True
+                    result["warning"] = f"Output truncated at {max_output_chars} characters for memory efficiency"
 
                 result["output"] = output_text.strip()
                 result["output_length"] = len(output_text)
+                result["lines_processed"] = lines_processed
                 result["message"] = f"Executed command: {command} (output captured)"
+                
+                if lines_processed >= max_lines:
+                    result["lines_truncated"] = True
+                    result["warning"] = (result.get("warning", "") + 
+                                       f" Output limited to {max_lines} lines for memory efficiency").strip()
             else:
                 result["output"] = ""
                 result["message"] = f"Executed command: {command} (no output captured)"
@@ -372,7 +453,7 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
             result["error"] = f"Failed to read output: {str(e)}"
             result["message"] = f"Executed command: {command} (failed to read output)"
     
-    return json.dumps(result, indent=2)
+    return optimize_json_response(result)
 
 
 @mcp.tool()
@@ -402,28 +483,32 @@ async def send_text(text: str) -> str:
     Returns:
         str: A JSON string confirming the text was sent.
     """
-    ctx = await connect_to_iterm2()
-    if ctx["error"]:
-        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+    ctx = await connection_manager.get_connection()
+    if ctx.get("error"):
+        return optimize_json_response({"success": False, "error": ctx["error"]})
 
     session = ctx["session"]
     if not session:
-        return json.dumps({"success": False, "error": "No active iTerm2 session found."}, indent=2)
+        return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
-    await session.async_send_text(text)
-    
-    result = {
-        "success": True,
-        "text": text,
-        "session_id": session.session_id,
-        "message": f"Sent text: {text}"
-    }
-    
-    return json.dumps(result, indent=2)
+    try:
+        await session.async_send_text(text)
+        
+        result = {
+            "success": True,
+            "text_length": len(text),
+            "session_id": session.session_id,
+            "message": f"Sent {len(text)} characters"
+        }
+        
+        return optimize_json_response(result)
+        
+    except Exception as e:
+        return optimize_json_response({"success": False, "error": str(e)})
 
 
 @mcp.tool()
-async def read_terminal_output(timeout: int = 5) -> str:
+async def read_terminal_output(timeout: int = 5, max_lines: int = 100) -> str:
     """
     📺 PRIORITY 5 - TERMINAL SCREEN READER 📺
     
@@ -443,32 +528,34 @@ async def read_terminal_output(timeout: int = 5) -> str:
     
     READ-ONLY: This tool never modifies anything - completely safe.
     TERMINAL-SPECIFIC: Only works with current iTerm2 session screen.
+    MEMORY-OPTIMIZED: Limits output to prevent memory issues.
 
     Args:
         timeout (int): The maximum time in seconds to wait for the screen contents. Defaults to 5.
+        max_lines (int): Maximum number of lines to read for memory efficiency. Defaults to 100.
 
     Returns:
         str: A JSON string containing the captured terminal output.
     """
-    ctx = await connect_to_iterm2()
-    if ctx["error"]:
-        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+    ctx = await connection_manager.get_connection()
+    if ctx.get("error"):
+        return optimize_json_response({"success": False, "error": ctx["error"]})
 
     session = ctx["session"]
     if not session:
-        return json.dumps({"success": False, "error": "No active iTerm2 session found."}, indent=2)
+        return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
     try:
-        # Get the current screen contents
         screen = await asyncio.wait_for(
             session.async_get_screen_contents(),
             timeout=timeout
         )
         
         if screen:
-            # Extract the text content using the correct API
             output_text = ""
-            for i in range(screen.number_of_lines):
+            actual_lines = min(screen.number_of_lines, max_lines)
+            
+            for i in range(actual_lines):
                 line = screen.line(i)
                 if line.string:
                     output_text += line.string + "\n"
@@ -476,25 +563,34 @@ async def read_terminal_output(timeout: int = 5) -> str:
             result = {
                 "success": True,
                 "output": output_text.strip(),
-                "output_length": len(output_text),
+                "lines_read": actual_lines,
+                "total_lines_available": screen.number_of_lines,
                 "session_id": session.session_id,
-                "message": f"Read terminal output ({len(output_text)} characters)"
+                "message": f"Read terminal output ({len(output_text)} characters, {actual_lines} lines)"
             }
+            
+            if screen.number_of_lines > max_lines:
+                result["lines_truncated"] = True
+                result["warning"] = f"Output limited to {max_lines} lines for memory efficiency"
+                
         else:
             result = {
                 "success": True,
                 "output": "",
-                "output_length": 0,
+                "lines_read": 0,
                 "session_id": session.session_id,
                 "message": "No terminal output available"
             }
         
-        return json.dumps(result, indent=2)
+        return optimize_json_response(result)
+        
     except asyncio.TimeoutError:
-        return json.dumps({
+        return optimize_json_response({
             "success": False,
             "error": f"Timeout reading terminal output after {timeout} seconds"
-        }, indent=2)
+        })
+    except Exception as e:
+        return optimize_json_response({"success": False, "error": str(e)})
 
 
 @mcp.tool()
@@ -510,23 +606,27 @@ async def clear_screen() -> str:
     Returns:
         str: A JSON string confirming the screen was cleared.
     """
-    ctx = await connect_to_iterm2()
-    if ctx["error"]:
-        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+    ctx = await connection_manager.get_connection()
+    if ctx.get("error"):
+        return optimize_json_response({"success": False, "error": ctx["error"]})
 
     session = ctx["session"]
     if not session:
-        return json.dumps({"success": False, "error": "No active iTerm2 session found."}, indent=2)
+        return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
-    await session.async_send_text("\x0c")  # Form feed character
-    
-    result = {
-        "success": True,
-        "session_id": session.session_id,
-        "message": "Screen cleared"
-    }
-    
-    return json.dumps(result, indent=2)
+    try:
+        await session.async_send_text("\x0c")  # Form feed character
+        
+        result = {
+            "success": True,
+            "session_id": session.session_id,
+            "message": "Screen cleared"
+        }
+        
+        return optimize_json_response(result)
+        
+    except Exception as e:
+        return optimize_json_response({"success": False, "error": str(e)})
 
 
 @mcp.tool()
@@ -542,9 +642,9 @@ async def list_profiles() -> str:
     Returns:
         str: A JSON string containing a list of profile names.
     """
-    ctx = await connect_to_iterm2()
-    if ctx["error"]:
-        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+    ctx = await connection_manager.get_connection()
+    if ctx.get("error"):
+        return optimize_json_response({"success": False, "error": ctx["error"]})
 
     connection = ctx["connection"]
     profiles = await iterm2.Profile.async_get(connection)
@@ -557,7 +657,7 @@ async def list_profiles() -> str:
         "message": f"Found {len(profile_list)} profiles"
     }
     
-    return json.dumps(result, indent=2)
+    return optimize_json_response(result)
 
 
 @mcp.tool()
@@ -576,17 +676,17 @@ async def switch_profile(profile: str) -> str:
     Returns:
         str: A JSON string confirming the profile switch.
     """
-    ctx = await connect_to_iterm2()
-    if ctx["error"]:
-        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+    ctx = await connection_manager.get_connection()
+    if ctx.get("error"):
+        return optimize_json_response({"success": False, "error": ctx["error"]})
 
     connection, session = ctx["connection"], ctx["session"]
     if not session:
-        return json.dumps({"success": False, "error": "No active iTerm2 session found."}, indent=2)
+        return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
     profile_obj = await iterm2.Profile.async_get(connection, [profile])
     if not profile_obj:
-        return json.dumps({"success": False, "error": f"Profile '{profile}' not found"}, indent=2)
+        return optimize_json_response({"success": False, "error": f"Profile '{profile}' not found"})
     
     await session.async_set_profile(profile_obj[0])
     
@@ -597,7 +697,7 @@ async def switch_profile(profile: str) -> str:
         "message": f"Switched to profile: {profile}"
     }
     
-    return json.dumps(result, indent=2)
+    return optimize_json_response(result)
 
 
 @mcp.tool()
@@ -613,13 +713,13 @@ async def get_session_info() -> str:
     Returns:
         str: A JSON string containing the window, tab, and session IDs.
     """
-    ctx = await connect_to_iterm2()
-    if ctx["error"]:
-        return json.dumps({"success": False, "error": ctx["error"]}, indent=2)
+    ctx = await connection_manager.get_connection()
+    if ctx.get("error"):
+        return optimize_json_response({"success": False, "error": ctx["error"]})
 
     window, tab, session = ctx["window"], ctx["tab"], ctx["session"]
     if not (window and tab and session):
-        return json.dumps({"success": False, "error": "Could not retrieve complete session info."}, indent=2)
+        return optimize_json_response({"success": False, "error": "Could not retrieve complete session info."})
 
     result = {
         "success": True,
@@ -629,7 +729,7 @@ async def get_session_info() -> str:
         "message": f"Current session: {session.session_id}"
     }
     
-    return json.dumps(result, indent=2)
+    return optimize_json_response(result)
 
 
 @mcp.tool()
@@ -671,13 +771,15 @@ async def write_file(file_path: str, content: str, require_confirmation: bool = 
     Returns:
         str: A JSON string confirming success or reporting an error.
     """
-    
+    # Create parent directories if they don't exist
+    parent_dir = Path(file_path).parent
+    parent_dir.mkdir(parents=True, exist_ok=True)
 
     if os.path.exists(file_path) and not require_confirmation:
-        return json.dumps({
+        return optimize_json_response({
             "success": False,
             "error": f"File '{file_path}' already exists. Set `require_confirmation=True` to overwrite."
-        }, indent=2)
+        })
 
     try:
         with open(file_path, "w") as f:
@@ -688,13 +790,13 @@ async def write_file(file_path: str, content: str, require_confirmation: bool = 
             "content_length": len(content),
             "message": f"Successfully wrote {len(content)} characters to {file_path}"
         }
-        return json.dumps(result, indent=2)
+        return optimize_json_response(result)
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)}, indent=2)
+        return optimize_json_response({"success": False, "error": str(e)})
 
 
 @mcp.tool()
-async def read_file(file_path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+async def read_file(file_path: str, start_line: Optional[int] = None, end_line: Optional[int] = None, max_size_mb: float = 10.0) -> str:
     """
     🏆 PRIORITY 1 - FILE READING TOOL 🏆
     
@@ -720,41 +822,64 @@ async def read_file(file_path: str, start_line: Optional[int] = None, end_line: 
     • Handles unicode and special characters correctly
     • Optional line slicing without external tools
     • No output formatting issues or terminal paging
+    • Memory limits to prevent system issues
     
     READ-ONLY: This tool never modifies files - completely safe.
+    MEMORY-OPTIMIZED: Includes size limits to prevent memory issues.
 
     Args:
         file_path (str): The path to the file to read.
         start_line (Optional[int]): The 1-indexed line number to start reading from.
         end_line (Optional[int]): The 1-indexed line number to stop reading at (inclusive).
+        max_size_mb (float): Maximum file size to read in MB. Defaults to 10.0MB.
 
     Returns:
         str: A JSON string with the file content or an error.
     """
-    
-
     try:
-        with open(file_path, 'r') as f:
-            lines = f.readlines()
+        # Check file size before reading
+        file_size = os.path.getsize(file_path)
+        max_size_bytes = max_size_mb * 1024 * 1024
         
-        if start_line is not None and end_line is not None:
-            # Adjust for 0-based indexing and slice
-            content = "".join(lines[start_line - 1:end_line])
-        elif start_line is not None:
-            content = "".join(lines[start_line - 1:])
-        else:
-            content = "".join(lines)
+        if file_size > max_size_bytes:
+            return optimize_json_response({
+                "success": False,
+                "error": f"File too large ({file_size / 1024 / 1024:.1f}MB > {max_size_mb}MB limit)",
+                "hint": "Use start_line/end_line parameters to read specific sections or increase max_size_mb"
+            })
+        
+        with open(file_path, 'r') as f:
+            if start_line is not None or end_line is not None:
+                # Read only specific lines to save memory
+                lines = []
+                current_line = 1
+                
+                for line in f:
+                    if start_line is not None and current_line < start_line:
+                        current_line += 1
+                        continue
+                    if end_line is not None and current_line > end_line:
+                        break
+                    lines.append(line)
+                    current_line += 1
+                    
+                content = "".join(lines)
+            else:
+                content = f.read()
             
         result = {
             "success": True,
             "file_path": file_path,
-            "content": content
+            "content": content,
+            "file_size_bytes": file_size,
+            "content_length": len(content)
         }
-        return json.dumps(result, indent=2)
+        return optimize_json_response(result)
+        
     except FileNotFoundError:
-        return json.dumps({"success": False, "error": f"File not found: {file_path}"}, indent=2)
+        return optimize_json_response({"success": False, "error": f"File not found: {file_path}"})
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)}, indent=2)
+        return optimize_json_response({"success": False, "error": str(e)})
 
 
 @mcp.tool()
@@ -794,13 +919,11 @@ async def list_directory(path: str, recursive: bool = False) -> str:
     Returns:
         str: A JSON string with a list of files and directories, or an error.
     """
-    
-
     try:
         # Expand '~' and resolve symlinks for accurate checks
         resolved = Path(path).expanduser().resolve()
         if not resolved.is_dir():
-            return json.dumps({"success": False, "error": f"Not a directory: {path}"}, indent=2)
+            return optimize_json_response({"success": False, "error": f"Not a directory: {path}"})
 
         contents = []
         if recursive:
@@ -820,11 +943,12 @@ async def list_directory(path: str, recursive: bool = False) -> str:
         result = {
             "success": True,
             "path": str(resolved),
-            "contents": contents
+            "contents": contents,
+            "count": len(contents)
         }
-        return json.dumps(result, indent=2)
+        return optimize_json_response(result)
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)}, indent=2)
+        return optimize_json_response({"success": False, "error": str(e)})
 
 
 @mcp.tool()
@@ -870,13 +994,11 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
     Returns:
         str: A JSON string confirming success or reporting an error.
     """
-    
-
     if not new_content and not require_confirmation:
-        return json.dumps({
+        return optimize_json_response({
             "success": False,
             "error": "Replacing content with an empty string will delete lines. Set `require_confirmation=True` to proceed."
-        }, indent=2)
+        })
 
     try:
         with open(file_path, 'r') as f:
@@ -901,15 +1023,17 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
         result = {
             "success": True,
             "file_path": file_path,
+            "lines_replaced": end_line - start_line + 1,
+            "new_lines_count": len(new_lines),
             "message": f"Successfully replaced lines {start_line}-{end_line} in {file_path}"
         }
-        return json.dumps(result, indent=2)
+        return optimize_json_response(result)
     except FileNotFoundError:
-        return json.dumps({"success": False, "error": f"File not found: {file_path}"}, indent=2)
+        return optimize_json_response({"success": False, "error": f"File not found: {file_path}"})
     except IndexError:
-        return json.dumps({"success": False, "error": "Line numbers are out of range for the file."}, indent=2)
+        return optimize_json_response({"success": False, "error": "Line numbers are out of range for the file."})
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)}, indent=2)
+        return optimize_json_response({"success": False, "error": str(e)})
 
 
 @mcp.tool()
@@ -952,8 +1076,6 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
     Returns:
         str: A JSON string containing a list of search results or an error.
     """
-    
-
     try:
         # Find the ripgrep executable in a robust way
         rg_path = shutil.which("rg")
@@ -966,10 +1088,10 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
                     break
         
         if not rg_path:
-            return json.dumps({
+            return optimize_json_response({
                 "success": False, 
                 "error": "The 'rg' (ripgrep) command was not found in your PATH or common locations. Please install it and ensure it's accessible."
-            }, indent=2)
+            })
 
         command = [rg_path, '--json', query, path]
         if not case_sensitive:
@@ -987,7 +1109,7 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
             # A real error will have content in stderr.
             error_message = stderr.decode().strip()
             if "No files were searched" not in error_message:
-                 return json.dumps({"success": False, "error": error_message}, indent=2)
+                 return optimize_json_response({"success": False, "error": error_message})
 
         results = []
         for line in stdout.decode().splitlines():
@@ -1004,17 +1126,94 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
                 # Ignore lines that aren't valid JSON or don't have the expected structure
                 continue
         
-        return json.dumps({"success": True, "query": query, "results": results}, indent=2)
+        result = {
+            "success": True, 
+            "query": query, 
+            "results": results,
+            "results_count": len(results),
+            "search_path": path
+        }
+        
+        return optimize_json_response(result)
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)}, indent=2)
+        return optimize_json_response({"success": False, "error": str(e)})
 
+# =============================================================================
+# MEMORY MANAGEMENT TOOLS
+# =============================================================================
+
+@mcp.tool()
+async def cleanup_connections() -> str:
+    """
+    🧹 Manual cleanup tool for memory management during long sessions.
+    
+    Use this tool periodically during long coding sessions to free up memory
+    and reset connections. Especially useful after many tool calls.
+    """
+    try:
+        await connection_manager.cleanup()
+        gc.collect()  # Force garbage collection
+        
+        result = {
+            "success": True,
+            "message": "Connections cleaned up and garbage collection forced",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        return optimize_json_response(result)
+        
+    except Exception as e:
+        return optimize_json_response({"success": False, "error": str(e)})
+
+@mcp.tool()
+async def get_memory_stats() -> str:
+    """
+    📊 Get basic memory usage stats for debugging long sessions.
+    
+    Returns current memory usage and connection status. Useful for
+    monitoring memory during long coding sessions or debugging issues.
+    """
+    try:
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            memory_info = process.memory_info()
+            
+            memory_stats = {
+                "rss_mb": round(memory_info.rss / 1024 / 1024, 2),
+                "vms_mb": round(memory_info.vms / 1024 / 1024, 2),
+                "percent": round(process.memory_percent(), 2)
+            }
+        except ImportError:
+            memory_stats = {
+                "error": "psutil not available - install with 'pip install psutil' for detailed memory stats"
+            }
+        
+        result = {
+            "success": True,
+            "memory_stats": memory_stats,
+            "connection_manager": {
+                "has_active_connection": connection_manager._connection is not None,
+                "last_used": connection_manager._last_used.isoformat() if connection_manager._last_used else None
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        return optimize_json_response(result)
+        
+    except Exception as e:
+        return optimize_json_response({"success": False, "error": str(e)})
 
 if __name__ == "__main__":
-    # Run the FastMCP server
-    print("Starting MCP server...", file=sys.stderr)
+    # Run the FastMCP server with proper cleanup
+    print("Starting memory-optimized iTerm2 MCP server...", file=sys.stderr)
     try:
         mcp.run()
+    except KeyboardInterrupt:
+        print("Shutting down server...", file=sys.stderr)
+        asyncio.run(connection_manager.cleanup())
     except Exception as e:
         print(f"MCP server crashed: {e}", file=sys.stderr)
         import traceback
-        traceback.print_exc(file=sys.stderr) 
+        traceback.print_exc(file=sys.stderr)
+        asyncio.run(connection_manager.cleanup())
