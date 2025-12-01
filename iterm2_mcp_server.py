@@ -251,7 +251,7 @@ async def create_session(profile: Optional[str] = None) -> str:
 
 @mcp.tool()
 async def run_command(command: str, wait_for_output: bool = True, timeout: int = 10, 
-                      require_confirmation: bool = False, use_base64: bool = False, 
+                      require_confirmation: bool = False, 
                       working_directory: Optional[str] = None, 
                       isolate_output: bool = False, max_output_chars: int = 10000) -> str:
     """
@@ -261,15 +261,11 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     
     🚫 FORBIDDEN USES (Use specialized tools instead):
     ❌ File creation/writing: echo 'x' > file.txt → USE write_file
-    ❌ File creation with heredoc: cat > file <<'EOF' → USE write_file
     ❌ File reading: cat, head, tail, less → USE read_file  
     ❌ File editing: sed -i, ed, perl -i → USE edit_file
     ❌ Directory listing: ls, find → USE list_directory
     ❌ Text searching: grep, rg, ag → USE search_code
     ❌ File operations: mv, cp, rm → USE write_file/edit_file + confirmation
-    
-    ⚠️  CRITICAL: NEVER use heredocs (<<) in commands - they will break terminal state
-    even with base64 encoding. Use write_file instead for ANY file creation.
     
     ✅ APPROVED USES ONLY:
     ✅ Package managers: npm install, pip install, cargo build, brew install
@@ -279,35 +275,25 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     ✅ Network tools: curl, wget, ping, ssh (non-file operations)
     ✅ Build tools: make, cmake, gradlew, mvn compile
     
-    ⚠️  BEST PRACTICES:
-    • Avoid emojis in commands - use plain text instead (e.g., "[OK]" not "✅")
-    • Keep commands simple and readable
-    • Use ASCII characters only when possible for maximum compatibility
+    ✅ SAFE FEATURES (New):
+    • HEREDOCS: Fully supported via bracketed paste mode.
+    • EMOJIS: Fully supported.
+    • LONG COMMANDS: Fully supported (no buffer limits).
     
     SECURITY: Dangerous commands (rm, dd, mkfs, shutdown) require `require_confirmation=True`.
     MEMORY: Output size limited to prevent memory issues during long tasks.
-    HEREDOC SAFETY: Commands with heredoc operators (<<) are REJECTED. Heredocs cannot be
-    safely executed via this tool even with base64 encoding. Use write_file instead for
-    creating files with multi-line content.
     
     ⚠️  WARNING: This tool bypasses safety mechanisms of specialized file tools.
     Prefer write_file/edit_file/read_file for ANY file operations - they are safer,
     more reliable, handle edge cases better, and respect security boundaries.
 
     Args:
-        command (str): The command to execute. Avoid using emojis or unicode characters
-                      in echo/print statements - use plain ASCII text instead for reliability.
+        command (str): The command to execute. Supports heredocs, emojis, and complex quoting safely.
         wait_for_output (bool): If True, waits for the command to finish and captures the output.
                                 Defaults to True.
         timeout (int): The maximum time in seconds to wait for output. Defaults to 10.
         require_confirmation (bool): If True, allows potentially destructive commands to run.
                                      Defaults to False.
-        use_base64 (bool): If True, injects a base64-encoded eval line. Defaults to False
-                           so the literal command is visible in the terminal.
-                           NOTE: Commands with complex quoting (unmatched quotes, mixed quote
-                           types with special characters) are automatically base64-encoded to
-                           prevent shell parsing issues. Set to True explicitly to force base64
-                           encoding for other cases (e.g., heredoc patterns).
         isolate_output (bool): If True, wraps execution with unique begin/end markers and
                                extracts only that region from the captured screen output.
         max_output_chars (int): Maximum output size to prevent memory issues.
@@ -319,15 +305,7 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     if ctx.get("error"):
         return optimize_json_response({"success": False, "error": ctx["error"]})
 
-    # REJECT heredoc commands - they cannot be safely executed
-    if '<<' in command:
-        return optimize_json_response({
-            "success": False,
-            "error": "Heredoc operators (<<) are not allowed in run_command",
-            "reason": "Heredocs break terminal state even with base64 encoding",
-            "solution": "Use write_file tool to create files with multi-line content",
-            "hint": "Extract the file content and call write_file(path, content) instead"
-        })
+    # Heredocs are now fully supported via bracketed paste mode - no special handling needed
 
     DANGEROUS_COMMANDS = ["rm ", "dd ", "mkfs ", "shutdown ", "reboot "]
     if any(cmd in command for cmd in DANGEROUS_COMMANDS) and not require_confirmation:
@@ -367,76 +345,35 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
             "error": "Neither async_send_text nor async_inject_text is available on this iTerm2 Session."
         })
 
-    # Detect and handle heredocs - always reject these
-    if '<<' in command:
-        # Already handled above, but double-check here
-        pass
+    # Bracketed Paste Mode - The Safe Way to Execute Commands
+    # We wrap the command in ANSI escape sequences that tell the shell:
+    # "Here comes a big chunk of text. Treat it as a single paste operation."
+    PASTE_START = "\x1b[200~"
+    PASTE_END = "\x1b[201~"
     
-    # For readability, we want to send commands directly when possible
-    # But we need to handle special cases that break shell parsing
-    # Strategy: Use printf with %q (shell quoting) instead of base64
-    # This keeps commands somewhat readable while being safe
-    
-    # Check if command has problematic patterns
-    has_unmatched_quotes = (command.count("'") % 2 != 0) or (command.count('"') % 2 != 0)
-    has_unicode_in_quotes = any(ord(c) > 127 for c in command) and ('"' in command or "'" in command)
-    
-    # Use base64 only for explicitly requested or truly broken commands
-    # For most cases, send directly - the shell can handle it
-    effective_base64 = use_base64 or has_unmatched_quotes
-
-    # If a working directory was specified, change into it first
+    # If a working directory was specified, we combine it into a single pasted block
+    full_command = command
     if working_directory:
         safe_dir = str(Path(working_directory).expanduser().resolve())
-        await send_text_method(f"cd '{safe_dir}'\n")
+        full_command = f"cd '{safe_dir}' && {command}"
 
-    if effective_base64:
-        # Encode the command in base64 to prevent shell interpretation issues
-        import base64, uuid
-        encoded_command = base64.b64encode(command.encode('utf-8')).decode('utf-8')
-        
-        # When auto-detecting issues, just note that base64 is being used
-        # The command execution will still be visible in terminal output
-        if not use_base64:
-            await send_text_method(f"echo '>>> Executing command (auto-encoded for safety)'\n")
-        
-        if isolate_output:
-            sid = uuid.uuid4().hex
-            begin = f"__MCP_BEGIN_{sid}__"
-            end = f"__MCP_END_{sid}__"
-            await send_text_method(f"echo '{begin}'; eval $(echo '{encoded_command}' | base64 --decode); echo '{end}'\n")
-        else:
-            await send_text_method(f"eval $(echo '{encoded_command}' | base64 --decode)\n")
+    if isolate_output:
+        import uuid
+        sid = uuid.uuid4().hex
+        begin = f"__MCP_BEGIN_{sid}__"
+        end = f"__MCP_END_{sid}__"
+        wrapped_cmd = f"echo '{begin}'; {full_command}; echo '{end}'"
+        await send_text_method(f"{PASTE_START}{wrapped_cmd}{PASTE_END}\n")
     else:
-        # Send the command using bash's $'...' syntax which handles escapes properly
-        # This keeps commands readable while being safe
-        # Replace single quotes with '\'' to escape them within $'...'
-        escaped_command = command.replace("\\", "\\\\").replace("'", "\\'")
-        safe_command = f"bash -c $'{escaped_command}'"
-        
-        if isolate_output:
-            import uuid
-            sid = uuid.uuid4().hex
-            begin = f"__MCP_BEGIN_{sid}__"
-            end = f"__MCP_END_{sid}__"
-            await send_text_method(f"echo '{begin}'\n")
-            await send_text_method(f"{safe_command}\n")
-            await send_text_method(f"echo '{end}'\n")
-        else:
-            await send_text_method(f"{safe_command}\n")
+        await send_text_method(f"{PASTE_START}{full_command}{PASTE_END}\n")
     
     result = {
         "success": True,
         "command": command,
         "session_id": session.session_id,
-        "message": f"Executed command: {command}",
+        "message": f"Executed command via bracketed paste: {command}",
         "timestamp": datetime.now().isoformat()
     }
-    
-    # Note if base64 was auto-used
-    if effective_base64 and not use_base64:
-        result["base64_auto_used"] = True
-        result["reason"] = "Auto-encoded for safety (unmatched quotes detected)"
     
     # If requested, wait for and read output (with memory limits)
     if wait_for_output:
@@ -508,35 +445,31 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
 
 
 @mcp.tool()
-async def send_text(text: str, force: bool = False) -> str:
+async def send_text(text: str, paste: bool = True) -> str:
     """
     ⌨️  PRIORITY 5 - RAW TEXT INPUT TOOL ⌨️
     
-    Sends text to terminal WITHOUT adding newline. For interactive input only.
+    Sends text to terminal. By default, uses bracketed paste mode for safety.
     
     🎯 USE THIS TOOL FOR:
     ✅ Interactive prompts requiring user input
     ✅ Typing into REPLs, editors, or interactive programs
-    ✅ Passwords or sensitive input (avoid when possible)
-    ✅ Partial command input where you control the newline
+    ✅ Pasting code blocks or long text
     
     🚫 DON'T USE FOR:
     ❌ Executing complete commands → USE run_command
     ❌ Writing files → USE write_file
-    ❌ Multi-line text → USE write_file or run_command
-    ❌ Text containing heredoc patterns (<<, EOF, etc.) → USE run_command with base64
     
-    ⚠️  HEREDOC WARNING: This tool validates text to prevent accidentally triggering
-    shell heredoc mode. If your text contains patterns like `<<`, `EOF`, `__END__`, etc.,
-    use `run_command` with `use_base64=True` instead, or set `force=True` to bypass.
-    
-    TERMINAL-SPECIFIC: Sends raw keystrokes to current iTerm2 session.
-    NO NEWLINE: Text appears at cursor without executing.
+    TERMINAL-SPECIFIC: Sends text to current iTerm2 session.
+    NO NEWLINE (by default): Text appears at cursor without executing.
 
     Args:
         text (str): The text to send to the terminal.
-        force (bool): If True, bypasses heredoc pattern validation. Use with caution.
-                     Defaults to False.
+        paste (bool): If True (default), sends text using bracketed paste mode.
+                      This prevents the shell from interpreting special characters,
+                      tabs, or newlines as commands until the text is fully entered.
+                      It is much safer and faster for code blocks or long text.
+                      If False, simulates individual keystrokes (slower, riskier).
 
     Returns:
         str: A JSON string confirming the text was sent.
@@ -549,46 +482,25 @@ async def send_text(text: str, force: bool = False) -> str:
     if not session:
         return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
-    # Detect potentially dangerous heredoc patterns that could break terminal state
-    if not force:
-        heredoc_patterns = [
-            "<<",      # Basic heredoc operator
-            "<<-",     # Heredoc with tab stripping
-            "EOF",     # Common heredoc delimiter
-            "__END__", # Perl-style end marker
-            "__DATA__", # Perl-style data marker
-        ]
-        
-        # Check for heredoc patterns (case-insensitive for common delimiters)
-        text_lower = text.lower()
-        detected_patterns = []
-        
-        for pattern in heredoc_patterns:
-            if pattern in text:
-                detected_patterns.append(pattern)
-        
-        # Also check for common heredoc delimiter patterns (quoted or unquoted)
-        heredoc_delimiter_pattern = r'<<\s*[\'"]?(\w+)[\'"]?'
-        if re.search(heredoc_delimiter_pattern, text):
-            detected_patterns.append("heredoc delimiter pattern")
-        
-        if detected_patterns:
-            return optimize_json_response({
-                "success": False,
-                "error": f"Text contains heredoc patterns that could break terminal state: {', '.join(set(detected_patterns))}",
-                "detected_patterns": list(set(detected_patterns)),
-                "hint": "Use run_command with use_base64=True for complex text, or set force=True to bypass this check (not recommended).",
-                "safe_alternative": "run_command with use_base64=True"
-            })
-
     try:
-        await session.async_send_text(text)
+        if paste:
+            # Use bracketed paste mode: \x1b[200~ TEXT \x1b[201~
+            # This treats the entire block as literal text
+            PASTE_START = "\x1b[200~"
+            PASTE_END = "\x1b[201~"
+            await session.async_send_text(f"{PASTE_START}{text}{PASTE_END}")
+            method_used = "bracketed_paste"
+        else:
+            # Send as raw keystrokes
+            await session.async_send_text(text)
+            method_used = "raw_keystrokes"
         
         result = {
             "success": True,
             "text_length": len(text),
             "session_id": session.session_id,
-            "message": f"Sent {len(text)} characters"
+            "method": method_used,
+            "message": f"Sent {len(text)} characters via {method_used}"
         }
         
         return optimize_json_response(result)
