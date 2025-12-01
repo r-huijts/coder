@@ -258,11 +258,15 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     
     🚫 FORBIDDEN USES (Use specialized tools instead):
     ❌ File creation/writing: echo 'x' > file.txt → USE write_file
+    ❌ File creation with heredoc: cat > file <<'EOF' → USE write_file
     ❌ File reading: cat, head, tail, less → USE read_file  
     ❌ File editing: sed -i, ed, perl -i → USE edit_file
     ❌ Directory listing: ls, find → USE list_directory
     ❌ Text searching: grep, rg, ag → USE search_code
     ❌ File operations: mv, cp, rm → USE write_file/edit_file + confirmation
+    
+    ⚠️  CRITICAL: NEVER use heredocs (<<) in commands - they will break terminal state
+    even with base64 encoding. Use write_file instead for ANY file creation.
     
     ✅ APPROVED USES ONLY:
     ✅ Package managers: npm install, pip install, cargo build, brew install
@@ -274,9 +278,9 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     
     SECURITY: Dangerous commands (rm, dd, mkfs, shutdown) require `require_confirmation=True`.
     MEMORY: Output size limited to prevent memory issues during long tasks.
-    HEREDOC SAFETY: Commands are sent directly to the terminal (human-readable). Use
-    `use_base64=True` for commands containing heredoc patterns (<<, EOF, etc.) that might
-    break terminal state. The preview feature has been removed to prevent heredoc mode issues.
+    HEREDOC SAFETY: Commands with heredoc operators (<<) are REJECTED. Heredocs cannot be
+    safely executed via this tool even with base64 encoding. Use write_file instead for
+    creating files with multi-line content.
     
     ⚠️  WARNING: This tool bypasses safety mechanisms of specialized file tools.
     Prefer write_file/edit_file/read_file for ANY file operations - they are safer,
@@ -305,6 +309,16 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     ctx = await connection_manager.get_connection()
     if ctx.get("error"):
         return optimize_json_response({"success": False, "error": ctx["error"]})
+
+    # REJECT heredoc commands - they cannot be safely executed
+    if '<<' in command:
+        return optimize_json_response({
+            "success": False,
+            "error": "Heredoc operators (<<) are not allowed in run_command",
+            "reason": "Heredocs break terminal state even with base64 encoding",
+            "solution": "Use write_file tool to create files with multi-line content",
+            "hint": "Extract the file content and call write_file(path, content) instead"
+        })
 
     DANGEROUS_COMMANDS = ["rm ", "dd ", "mkfs ", "shutdown ", "reboot "]
     if any(cmd in command for cmd in DANGEROUS_COMMANDS) and not require_confirmation:
@@ -344,10 +358,15 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
             "error": "Neither async_send_text nor async_inject_text is available on this iTerm2 Session."
         })
 
-    # Detect commands with complex quoting that might break shell parsing
+    # Detect commands with complex quoting or heredocs that might break shell parsing
     # These need base64 encoding to prevent quote/unquote issues
     has_complex_quoting = False
+    has_heredoc = False
+    
     if not use_base64:
+        # Check for heredoc patterns that would break terminal state
+        has_heredoc = '<<' in command
+        
         # Check for potentially problematic quote patterns
         # - Unmatched quotes (odd number of single or double quotes)
         single_quotes = command.count("'")
@@ -360,7 +379,7 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
             char in command for char in ['$', '`', '\\', '&', '|', ';', '<', '>']
         )
         
-        has_complex_quoting = has_unmatched_quotes or (has_both_quote_types and has_special_with_quotes)
+        has_complex_quoting = has_unmatched_quotes or (has_both_quote_types and has_special_with_quotes) or has_heredoc
     
     # Use base64 when explicitly requested OR when complex quoting is detected
     # This prevents shell parsing issues while keeping simple commands readable
