@@ -274,6 +274,9 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     
     SECURITY: Dangerous commands (rm, dd, mkfs, shutdown) require `require_confirmation=True`.
     MEMORY: Output size limited to prevent memory issues during long tasks.
+    HEREDOC SAFETY: Commands are sent directly to the terminal (human-readable). Use
+    `use_base64=True` for commands containing heredoc patterns (<<, EOF, etc.) that might
+    break terminal state. The preview feature has been removed to prevent heredoc mode issues.
     
     ⚠️  WARNING: This tool bypasses safety mechanisms of specialized file tools.
     Prefer write_file/edit_file/read_file for ANY file operations - they are safer,
@@ -288,9 +291,10 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
                                      Defaults to False.
         use_base64 (bool): If True, injects a base64-encoded eval line. Defaults to False
                            so the literal command is visible in the terminal.
-                           Use this for commands containing heredoc patterns (<<, EOF, etc.)
-                           that might break terminal state. Multiline commands are sent
-                           directly for readability unless this is explicitly set to True.
+                           NOTE: Commands with complex quoting (unmatched quotes, mixed quote
+                           types with special characters) are automatically base64-encoded to
+                           prevent shell parsing issues. Set to True explicitly to force base64
+                           encoding for other cases (e.g., heredoc patterns).
         isolate_output (bool): If True, wraps execution with unique begin/end markers and
                                extracts only that region from the captured screen output.
         max_output_chars (int): Maximum output size to prevent memory issues.
@@ -340,9 +344,27 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
             "error": "Neither async_send_text nor async_inject_text is available on this iTerm2 Session."
         })
 
-    # Use base64 only when explicitly requested (for commands with heredoc patterns or special characters)
-    # Multiline commands are sent directly for human readability
-    effective_base64 = use_base64
+    # Detect commands with complex quoting that might break shell parsing
+    # These need base64 encoding to prevent quote/unquote issues
+    has_complex_quoting = False
+    if not use_base64:
+        # Check for potentially problematic quote patterns
+        # - Unmatched quotes (odd number of single or double quotes)
+        single_quotes = command.count("'")
+        double_quotes = command.count('"')
+        # - Commands with both single and double quotes (complex escaping)
+        # - Commands with quotes and special shell characters
+        has_both_quote_types = single_quotes > 0 and double_quotes > 0
+        has_unmatched_quotes = (single_quotes % 2 != 0) or (double_quotes % 2 != 0)
+        has_special_with_quotes = (single_quotes > 0 or double_quotes > 0) and any(
+            char in command for char in ['$', '`', '\\', '&', '|', ';', '<', '>']
+        )
+        
+        has_complex_quoting = has_unmatched_quotes or (has_both_quote_types and has_special_with_quotes)
+    
+    # Use base64 when explicitly requested OR when complex quoting is detected
+    # This prevents shell parsing issues while keeping simple commands readable
+    effective_base64 = use_base64 or has_complex_quoting
 
     # If a working directory was specified, change into it first
     if working_directory:
@@ -353,6 +375,12 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         # Encode the command in base64 to prevent shell interpretation issues
         import base64, uuid
         encoded_command = base64.b64encode(command.encode('utf-8')).decode('utf-8')
+        
+        # When auto-detecting complex quoting, just note that base64 is being used
+        # The command execution will still be visible in terminal output
+        if has_complex_quoting and not use_base64:
+            await send_text_method(f"echo '>>> Executing command (auto-encoded for quote safety)'\n")
+        
         if isolate_output:
             sid = uuid.uuid4().hex
             begin = f"__MCP_BEGIN_{sid}__"
@@ -367,7 +395,11 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
             sid = uuid.uuid4().hex
             begin = f"__MCP_BEGIN_{sid}__"
             end = f"__MCP_END_{sid}__"
-            await send_text_method(f"echo '{begin}'; {command}; echo '{end}'\n")
+            # Use a here-string to safely wrap commands with quotes
+            # This avoids quote escaping issues
+            await send_text_method(f"echo '{begin}'\n")
+            await send_text_method(f"{command}\n")
+            await send_text_method(f"echo '{end}'\n")
         else:
             await send_text_method(f"{command}\n")
     
@@ -378,6 +410,11 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         "message": f"Executed command: {command}",
         "timestamp": datetime.now().isoformat()
     }
+    
+    # Note if base64 was auto-used for complex quoting
+    if has_complex_quoting and not use_base64:
+        result["base64_auto_used"] = True
+        result["reason"] = "Complex quoting detected - auto-encoded for safety"
     
     # If requested, wait for and read output (with memory limits)
     if wait_for_output:
