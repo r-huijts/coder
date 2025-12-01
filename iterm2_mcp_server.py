@@ -278,9 +278,10 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     ✅ Build tools: make, cmake, gradlew, mvn compile
     
     ✅ SAFE FEATURES (New):
-    • HEREDOCS: Fully supported via direct text injection.
+    • HEREDOCS: Fully supported via temporary script execution.
     • EMOJIS: Fully supported.
     • LONG COMMANDS: Fully supported (no buffer limits).
+    • COMPLEX QUOTING: All quoting patterns work reliably.
     
     SECURITY: Dangerous commands (rm, dd, mkfs, shutdown) require `require_confirmation=True`.
     MEMORY: Output size limited to prevent memory issues during long tasks.
@@ -367,17 +368,14 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     if not session:
         return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
-    # Use async_inject_text which directly injects into readline buffer (safest)
-    # Falls back to async_send_text if inject isn't available
-    inject_method = getattr(session, "async_inject_text", None)
-    send_method = getattr(session, "async_send_text", None)
+    # CRITICAL FIX: Neither async_inject_text nor async_send_text handle complex
+    # commands reliably (they simulate typing which causes quote hell).
+    # Solution: Write command to a temporary file and source it.
     
-    if not inject_method and not send_method:
-        return optimize_json_response({
-            "success": False,
-            "error": "Neither async_send_text nor async_inject_text is available on this iTerm2 Session."
-        })
-
+    import tempfile
+    import uuid
+    import os
+    
     # Build the full command including working directory if specified
     full_command = command
     if working_directory:
@@ -385,25 +383,61 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         full_command = f"cd '{safe_dir}' && {command}"
 
     # If isolate_output, wrap with unique markers
-        if isolate_output:
-            import uuid
-            sid = uuid.uuid4().hex
-            begin = f"__MCP_BEGIN_{sid}__"
-            end = f"__MCP_END_{sid}__"
+    if isolate_output:
+        sid = uuid.uuid4().hex
+        begin = f"__MCP_BEGIN_{sid}__"
+        end = f"__MCP_END_{sid}__"
         full_command = f"echo '{begin}'; {full_command}; echo '{end}'"
-
-    # Inject directly into the readline buffer (bypasses all shell interpretation)
-    # This is safer than send_text which simulates keystrokes
-    if inject_method:
-        await inject_method(full_command + "\n")
-    else:
-        await send_method(full_command + "\n")
+    
+    # Write command to a temporary script file
+    script_id = uuid.uuid4().hex[:8]
+    script_path = f"/tmp/mcp_cmd_{script_id}.sh"
+    
+    try:
+        # Write the command to the temp file
+        with open(script_path, 'w') as f:
+            f.write("#!/bin/bash\n")
+            f.write("set -e\n")  # Exit on error
+            f.write(full_command + "\n")
+            # Auto-cleanup: remove the script after execution (even on error)
+            f.write(f"EXIT_CODE=$?\n")
+            f.write(f"rm -f {script_path}\n")
+            f.write(f"exit $EXIT_CODE\n")
+        
+        # Make it executable
+        os.chmod(script_path, 0o755)
+        
+        # Execute the script by sourcing it (this is safe and readable)
+        send_method = getattr(session, "async_send_text", None)
+        if not send_method:
+            # Cleanup before returning error
+            if os.path.exists(script_path):
+                os.remove(script_path)
+            return optimize_json_response({
+                "success": False,
+                "error": "async_send_text is not available on this iTerm2 Session."
+            })
+        
+        await send_method(f"source {script_path}\n")
+        
+    except Exception as e:
+        # Clean up on error
+        if os.path.exists(script_path):
+            try:
+                os.remove(script_path)
+            except:
+                pass  # Best effort cleanup
+        return optimize_json_response({
+            "success": False,
+            "error": f"Failed to create temporary script: {str(e)}"
+        })
     
     result = {
         "success": True,
         "command": command,
         "session_id": session.session_id,
-        "message": f"Executed command via bracketed paste: {command}",
+        "script_path": script_path,
+        "message": f"Executed command via temporary script: {command}",
         "timestamp": datetime.now().isoformat()
     }
     

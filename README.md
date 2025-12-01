@@ -53,13 +53,15 @@ That's it. The MCP client will now handle starting the server for you.
 
 ## Safety Features
 
-The server uses **Direct Text Injection** for robust command execution:
+The server uses **Temporary Script Execution** for robust command execution:
 
-### Direct Text Injection (async_inject_text)
-- All commands sent via `run_command` and `send_text` (by default) use iTerm2's `async_inject_text` API
-- This directly injects text into the readline buffer, completely bypassing keystroke simulation
-- **Zero shell interpretation** during injection - no premature execution, no buffer overflows, no escape sequence issues
+### Temporary Script Execution
+- All commands sent via `run_command` are written to temporary bash scripts in `/tmp/mcp_cmd_*.sh`
+- Scripts are executed via `source` command, then automatically delete themselves
+- This completely avoids quote interpretation issues that plague terminal automation
+- **Zero shell interpretation** during command transmission - no typing simulation, no quote hell
 - Supports **heredocs, emojis, complex quoting, and long commands** without any special handling
+- Terminal displays clean `source /tmp/mcp_cmd_abc123.sh` - still readable and debuggable
 
 ### What This Means for Agents
 - ✅ **Heredocs are fully supported**: Use them freely for multi-line file creation or scripts
@@ -86,9 +88,9 @@ The following tools are available through the MCP server.
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10`, `require_confirmation: bool = False`, `working_directory: str = None`, `isolate_output: bool = False`, `max_output_chars: int = 10000` | Executes a shell command using direct text injection. **Fully supports heredocs, emojis, and complex quoting**. For clean output parsing, use `isolate_output=True` and adjust `timeout` based on command duration (ffmpeg: 120-300s, builds: 300-600s). |
+| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10`, `require_confirmation: bool = False`, `working_directory: str = None`, `isolate_output: bool = False`, `max_output_chars: int = 10000` | Executes a shell command via temporary script file. **Fully supports heredocs, emojis, and complex quoting**. For clean output parsing, use `isolate_output=True` and adjust `timeout` based on command duration (ffmpeg: 120-300s, builds: 300-600s). |
 | `read_terminal_output` | `timeout: int = 5` | Reads the entire visible contents of the active iTerm2 screen. |
-| `send_text` | `text: str`, `paste: bool = True` | Sends text to the terminal. By default uses direct text injection for safe, atomic insertion. Set `paste=False` to simulate individual keystrokes (slower, riskier). |
+| `send_text` | `text: str`, `paste: bool = True` | Sends text to the terminal. By default uses async_inject_text for safe insertion. Set `paste=False` to simulate individual keystrokes (slower, riskier). |
 | `create_tab` | `profile: str = None` | Creates a new tab in the current iTerm2 window. |
 | `create_session` | `profile: str = None` | Creates a new session (split pane) in the current tab. |
 | `clear_screen` | | Clears the screen of the active session (like `Ctrl+L`). |
