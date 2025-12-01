@@ -10,6 +10,7 @@ This server is designed to be the bridge between a large language model's reason
 -   📂 **Precise Filesystem I/O:** Read, write, and perform surgical line-based edits on files. This avoids the ambiguity of `sed` or `echo` and allows the agent to safely manipulate code.
 -   🖥️ **Full Terminal Control:** Create tabs, split panes, run commands, and read screen output. The agent has a visible, interactive workspace within iTerm2.
 -   🤖 **Structured JSON API:** All tools return predictable JSON objects, making it easy for an agent to parse success/failure states and data without guessing.
+-   🛡️ **Safety Features:** Automatic detection and handling of complex quoting, heredoc prevention, and unicode/emoji handling to prevent terminal state corruption.
 
 ## Installation
 
@@ -50,6 +51,24 @@ Add the following configuration to your client's settings. **You must replace `/
 
 That's it. The MCP client will now handle starting the server for you.
 
+## Safety Features
+
+The server includes several safety mechanisms to prevent terminal state corruption:
+
+### Heredoc Prevention
+- **Heredoc operators (`<<`) are explicitly rejected** in `run_command` to prevent the terminal from getting stuck waiting for delimiters
+- Commands containing `<<` will return an error directing the agent to use `write_file` instead for file creation
+
+### Automatic Quote Handling
+- Commands with complex quoting patterns (unmatched quotes, mixed quote types with special characters) are automatically detected
+- These commands are safely wrapped using `bash -c $'...'` syntax which properly handles unicode, emojis, and special characters
+- Commands remain **human-readable** in the terminal while being safe to execute
+
+### Best Practices for Agents
+- **Avoid emojis in commands**: Use plain ASCII text instead (e.g., `[OK]` instead of `✅`)
+- **Use `write_file` for file creation**: Never use heredocs or `cat > file <<EOF` patterns
+- **Prefer specialized tools**: Use `write_file`, `read_file`, `edit_file` instead of shell redirection
+
 ## Tool Reference
 
 The following tools are available through the MCP server.
@@ -58,9 +77,9 @@ The following tools are available through the MCP server.
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10` | Executes a shell command in the active iTerm2 session and optionally captures the output. |
+| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10`, `use_base64: bool = False`, `require_confirmation: bool = False` | Executes a shell command in the active iTerm2 session. Automatically handles complex quoting safely. **Heredocs (`<<`) are rejected** - use `write_file` for file creation. Avoid emojis - use ASCII text like `[OK]` instead. |
 | `read_terminal_output` | `timeout: int = 5` | Reads the entire visible contents of the active iTerm2 screen. |
-| `send_text` | `text: str` | Sends a string of text to the active session without adding a newline. |
+| `send_text` | `text: str`, `force: bool = False` | Sends a string of text to the active session without adding a newline. Validates for heredoc patterns to prevent terminal state corruption. Use `force=True` to bypass validation if needed. |
 | `create_tab` | `profile: str = None` | Creates a new tab in the current iTerm2 window. |
 | `create_session` | `profile: str = None` | Creates a new session (split pane) in the current tab. |
 | `clear_screen` | | Clears the screen of the active session (like `Ctrl+L`). |
