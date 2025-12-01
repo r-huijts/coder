@@ -11,6 +11,7 @@ import sys
 import shutil
 import weakref
 import gc
+import re
 from typing import Optional, Dict, Any
 from pathlib import Path
 from datetime import datetime
@@ -248,7 +249,7 @@ async def create_session(profile: Optional[str] = None) -> str:
 @mcp.tool()
 async def run_command(command: str, wait_for_output: bool = True, timeout: int = 10, 
                       require_confirmation: bool = False, use_base64: bool = False, 
-                      preview: bool = True, working_directory: Optional[str] = None, 
+                      working_directory: Optional[str] = None, 
                       isolate_output: bool = False, max_output_chars: int = 10000) -> str:
     """
     ⚠️  SHELL EXECUTION - USE AS LAST RESORT ONLY ⚠️
@@ -287,8 +288,9 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
                                      Defaults to False.
         use_base64 (bool): If True, injects a base64-encoded eval line. Defaults to False
                            so the literal command is visible in the terminal.
-        preview (bool): If True and the command is multiline, prints a readable preview
-                        using a safe heredoc before execution. Defaults to True.
+                           Use this for commands containing heredoc patterns (<<, EOF, etc.)
+                           that might break terminal state. Multiline commands are sent
+                           directly for readability unless this is explicitly set to True.
         isolate_output (bool): If True, wraps execution with unique begin/end markers and
                                extracts only that region from the captured screen output.
         max_output_chars (int): Maximum output size to prevent memory issues.
@@ -338,19 +340,9 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
             "error": "Neither async_send_text nor async_inject_text is available on this iTerm2 Session."
         })
 
-    is_multiline = "\n" in command
-
-    # For multiline commands, default to base64 injection to avoid quoting/newline issues
-    effective_base64 = use_base64 or is_multiline
-
-    # Optionally change directory preview if provided
-
-    if is_multiline and preview:
-        # Print a readable, non-interpreted preview to the terminal
-        await send_text_method("echo '>>> Executing multiline command:'\n")
-        await send_text_method("cat <<'__MCP_PREVIEW__'\n")
-        await send_text_method(f"{command}\n")
-        await send_text_method("__MCP_PREVIEW__\n")
+    # Use base64 only when explicitly requested (for commands with heredoc patterns or special characters)
+    # Multiline commands are sent directly for human readability
+    effective_base64 = use_base64
 
     # If a working directory was specified, change into it first
     if working_directory:
@@ -457,7 +449,7 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
 
 
 @mcp.tool()
-async def send_text(text: str) -> str:
+async def send_text(text: str, force: bool = False) -> str:
     """
     ⌨️  PRIORITY 5 - RAW TEXT INPUT TOOL ⌨️
     
@@ -473,12 +465,19 @@ async def send_text(text: str) -> str:
     ❌ Executing complete commands → USE run_command
     ❌ Writing files → USE write_file
     ❌ Multi-line text → USE write_file or run_command
+    ❌ Text containing heredoc patterns (<<, EOF, etc.) → USE run_command with base64
+    
+    ⚠️  HEREDOC WARNING: This tool validates text to prevent accidentally triggering
+    shell heredoc mode. If your text contains patterns like `<<`, `EOF`, `__END__`, etc.,
+    use `run_command` with `use_base64=True` instead, or set `force=True` to bypass.
     
     TERMINAL-SPECIFIC: Sends raw keystrokes to current iTerm2 session.
     NO NEWLINE: Text appears at cursor without executing.
 
     Args:
         text (str): The text to send to the terminal.
+        force (bool): If True, bypasses heredoc pattern validation. Use with caution.
+                     Defaults to False.
 
     Returns:
         str: A JSON string confirming the text was sent.
@@ -490,6 +489,38 @@ async def send_text(text: str) -> str:
     session = ctx["session"]
     if not session:
         return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
+
+    # Detect potentially dangerous heredoc patterns that could break terminal state
+    if not force:
+        heredoc_patterns = [
+            "<<",      # Basic heredoc operator
+            "<<-",     # Heredoc with tab stripping
+            "EOF",     # Common heredoc delimiter
+            "__END__", # Perl-style end marker
+            "__DATA__", # Perl-style data marker
+        ]
+        
+        # Check for heredoc patterns (case-insensitive for common delimiters)
+        text_lower = text.lower()
+        detected_patterns = []
+        
+        for pattern in heredoc_patterns:
+            if pattern in text:
+                detected_patterns.append(pattern)
+        
+        # Also check for common heredoc delimiter patterns (quoted or unquoted)
+        heredoc_delimiter_pattern = r'<<\s*[\'"]?(\w+)[\'"]?'
+        if re.search(heredoc_delimiter_pattern, text):
+            detected_patterns.append("heredoc delimiter pattern")
+        
+        if detected_patterns:
+            return optimize_json_response({
+                "success": False,
+                "error": f"Text contains heredoc patterns that could break terminal state: {', '.join(set(detected_patterns))}",
+                "detected_patterns": list(set(detected_patterns)),
+                "hint": "Use run_command with use_base64=True for complex text, or set force=True to bypass this check (not recommended).",
+                "safe_alternative": "run_command with use_base64=True"
+            })
 
     try:
         await session.async_send_text(text)
