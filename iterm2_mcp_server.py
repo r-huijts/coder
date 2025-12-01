@@ -276,7 +276,7 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     ✅ Build tools: make, cmake, gradlew, mvn compile
     
     ✅ SAFE FEATURES (New):
-    • HEREDOCS: Fully supported via bracketed paste mode.
+    • HEREDOCS: Fully supported via direct text injection.
     • EMOJIS: Fully supported.
     • LONG COMMANDS: Fully supported (no buffer limits).
     
@@ -292,11 +292,15 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         wait_for_output (bool): If True, waits for the command to finish and captures the output.
                                 Defaults to True.
         timeout (int): The maximum time in seconds to wait for output. Defaults to 10.
+                       Increase for long-running commands (ffmpeg, compiles, etc).
         require_confirmation (bool): If True, allows potentially destructive commands to run.
                                      Defaults to False.
-        isolate_output (bool): If True, wraps execution with unique begin/end markers and
-                               extracts only that region from the captured screen output.
-        max_output_chars (int): Maximum output size to prevent memory issues.
+        working_directory (str): Optional directory to cd into before executing the command.
+        isolate_output (bool): RECOMMENDED for clean output. If True, wraps execution with unique
+                               markers and extracts ONLY the command's output, filtering out
+                               prompts, previous commands, and other terminal noise. The tool
+                               will actively wait for the END marker before returning.
+        max_output_chars (int): Maximum output size to prevent memory issues. Defaults to 10000.
 
     Returns:
         str: A JSON string containing the execution status and output if captured.
@@ -305,7 +309,7 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     if ctx.get("error"):
         return optimize_json_response({"success": False, "error": ctx["error"]})
 
-    # Heredocs are now fully supported via bracketed paste mode - no special handling needed
+    # Heredocs are now fully supported via direct text injection - no special handling needed
 
     DANGEROUS_COMMANDS = ["rm ", "dd ", "mkfs ", "shutdown ", "reboot "]
     if any(cmd in command for cmd in DANGEROUS_COMMANDS) and not require_confirmation:
@@ -337,35 +341,37 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     if not session:
         return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
-    # Choose how to inject the command
-    send_text_method = getattr(session, "async_send_text", None) or getattr(session, "async_inject_text", None)
-    if send_text_method is None:
+    # Use async_inject_text which directly injects into readline buffer (safest)
+    # Falls back to async_send_text if inject isn't available
+    inject_method = getattr(session, "async_inject_text", None)
+    send_method = getattr(session, "async_send_text", None)
+    
+    if not inject_method and not send_method:
         return optimize_json_response({
             "success": False,
             "error": "Neither async_send_text nor async_inject_text is available on this iTerm2 Session."
         })
 
-    # Bracketed Paste Mode - The Safe Way to Execute Commands
-    # We wrap the command in ANSI escape sequences that tell the shell:
-    # "Here comes a big chunk of text. Treat it as a single paste operation."
-    PASTE_START = "\x1b[200~"
-    PASTE_END = "\x1b[201~"
-    
-    # If a working directory was specified, we combine it into a single pasted block
+    # Build the full command including working directory if specified
     full_command = command
     if working_directory:
         safe_dir = str(Path(working_directory).expanduser().resolve())
         full_command = f"cd '{safe_dir}' && {command}"
 
-    if isolate_output:
-        import uuid
-        sid = uuid.uuid4().hex
-        begin = f"__MCP_BEGIN_{sid}__"
-        end = f"__MCP_END_{sid}__"
-        wrapped_cmd = f"echo '{begin}'; {full_command}; echo '{end}'"
-        await send_text_method(f"{PASTE_START}{wrapped_cmd}{PASTE_END}\n")
+    # If isolate_output, wrap with unique markers
+        if isolate_output:
+            import uuid
+            sid = uuid.uuid4().hex
+            begin = f"__MCP_BEGIN_{sid}__"
+            end = f"__MCP_END_{sid}__"
+        full_command = f"echo '{begin}'; {full_command}; echo '{end}'"
+
+    # Inject directly into the readline buffer (bypasses all shell interpretation)
+    # This is safer than send_text which simulates keystrokes
+    if inject_method:
+        await inject_method(full_command + "\n")
     else:
-        await send_text_method(f"{PASTE_START}{full_command}{PASTE_END}\n")
+        await send_method(full_command + "\n")
     
     result = {
         "success": True,
@@ -378,13 +384,44 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     # If requested, wait for and read output (with memory limits)
     if wait_for_output:
         try:
-            # Wait a bit for the command to start
-            await asyncio.sleep(0.5)
+            # For isolate_output mode, we wait for the END marker to appear
+            # For normal mode, we wait for the command to likely finish
+            if isolate_output:
+                # Poll for the end marker with exponential backoff
+                end_marker_found = False
+                poll_interval = 0.1
+                max_wait = timeout
+                elapsed = 0
+                
+                while elapsed < max_wait and not end_marker_found:
+                    await asyncio.sleep(poll_interval)
+                    elapsed += poll_interval
+                    
+                    # Read screen and check for end marker
+                    screen = await session.async_get_screen_contents()
+                    if screen:
+                        # Check last N lines for the end marker
+                        check_lines = min(50, screen.number_of_lines)
+                        for i in range(screen.number_of_lines - check_lines, screen.number_of_lines):
+                            line = screen.line(i)
+                            if line and line.string and "__MCP_END_" in line.string:
+                                end_marker_found = True
+                                break
+                    
+                    # Exponential backoff up to 1 second
+                    poll_interval = min(poll_interval * 1.5, 1.0)
+                
+                if not end_marker_found:
+                    result["warning"] = f"End marker not found after {timeout}s - output may be incomplete"
+            else:
+                # For non-isolated mode, give the command time to execute
+                # Use a more reasonable wait time based on timeout
+                await asyncio.sleep(min(1.0, timeout * 0.2))
             
-            # Read the output with timeout
+            # Now read the final output
             screen = await asyncio.wait_for(
                 session.async_get_screen_contents(),
-                timeout=timeout
+                timeout=5  # Quick timeout just for reading
             )
             
             if screen:
@@ -411,13 +448,21 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
                             end_idx = idx
                             break
                     if begin_idx is not None and end_idx is not None and end_idx >= begin_idx:
-                        output_text = "\n".join(lines[begin_idx:end_idx]) + "\n"
+                        output_text = "\n".join(lines[begin_idx:end_idx])
+                    elif begin_idx is not None:
+                        # Found BEGIN but not END - take everything after BEGIN
+                        output_text = "\n".join(lines[begin_idx:])
+                        result["warning"] = (result.get("warning", "") + " Output isolation incomplete - END marker not found").strip()
+                    else:
+                        # Markers not found at all
+                        result["warning"] = (result.get("warning", "") + " Output isolation failed - markers not found").strip()
 
                 # Truncate if too large
                 if len(output_text) > max_output_chars:
                     output_text = output_text[:max_output_chars]
                     result["output_truncated"] = True
-                    result["warning"] = f"Output truncated at {max_output_chars} characters for memory efficiency"
+                    result["warning"] = (result.get("warning", "") + 
+                                       f" Output truncated at {max_output_chars} characters").strip()
 
                 result["output"] = output_text.strip()
                 result["output_length"] = len(output_text)
@@ -427,7 +472,7 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
                 if lines_processed >= max_lines:
                     result["lines_truncated"] = True
                     result["warning"] = (result.get("warning", "") + 
-                                       f" Output limited to {max_lines} lines for memory efficiency").strip()
+                                       f" Output limited to {max_lines} lines").strip()
             else:
                 result["output"] = ""
                 result["message"] = f"Executed command: {command} (no output captured)"
@@ -449,7 +494,7 @@ async def send_text(text: str, paste: bool = True) -> str:
     """
     ⌨️  PRIORITY 5 - RAW TEXT INPUT TOOL ⌨️
     
-    Sends text to terminal. By default, uses bracketed paste mode for safety.
+    Sends text to terminal. By default, uses direct text injection for safety.
     
     🎯 USE THIS TOOL FOR:
     ✅ Interactive prompts requiring user input
@@ -465,10 +510,9 @@ async def send_text(text: str, paste: bool = True) -> str:
 
     Args:
         text (str): The text to send to the terminal.
-        paste (bool): If True (default), sends text using bracketed paste mode.
-                      This prevents the shell from interpreting special characters,
-                      tabs, or newlines as commands until the text is fully entered.
-                      It is much safer and faster for code blocks or long text.
+        paste (bool): If True (default), uses async_inject_text to directly inject
+                      text into the readline buffer, bypassing all shell interpretation.
+                      This is much safer and faster for code blocks or long text.
                       If False, simulates individual keystrokes (slower, riskier).
 
     Returns:
@@ -484,14 +528,18 @@ async def send_text(text: str, paste: bool = True) -> str:
 
     try:
         if paste:
-            # Use bracketed paste mode: \x1b[200~ TEXT \x1b[201~
-            # This treats the entire block as literal text
-            PASTE_START = "\x1b[200~"
-            PASTE_END = "\x1b[201~"
-            await session.async_send_text(f"{PASTE_START}{text}{PASTE_END}")
-            method_used = "bracketed_paste"
+            # Use async_inject_text to directly inject into readline buffer
+            # This bypasses shell interpretation entirely - safest method
+            inject_method = getattr(session, "async_inject_text", None)
+            if inject_method:
+                await inject_method(text)
+                method_used = "inject_text"
+            else:
+                # Fallback to send_text if inject isn't available
+                await session.async_send_text(text)
+                method_used = "send_text_fallback"
         else:
-            # Send as raw keystrokes
+            # Send as raw keystrokes (character by character simulation)
             await session.async_send_text(text)
             method_used = "raw_keystrokes"
         

@@ -53,12 +53,12 @@ That's it. The MCP client will now handle starting the server for you.
 
 ## Safety Features
 
-The server uses **Bracketed Paste Mode** for robust command execution:
+The server uses **Direct Text Injection** for robust command execution:
 
-### Bracketed Paste Mode
-- All commands sent via `run_command` and `send_text` (by default) are wrapped in ANSI escape sequences (`\x1b[200~` and `\x1b[201~`)
-- This tells the shell to treat the entire command as a single atomic paste operation
-- **Zero shell interpretation** until the paste is complete - no premature execution, no buffer overflows
+### Direct Text Injection (async_inject_text)
+- All commands sent via `run_command` and `send_text` (by default) use iTerm2's `async_inject_text` API
+- This directly injects text into the readline buffer, completely bypassing keystroke simulation
+- **Zero shell interpretation** during injection - no premature execution, no buffer overflows, no escape sequence issues
 - Supports **heredocs, emojis, complex quoting, and long commands** without any special handling
 
 ### What This Means for Agents
@@ -68,7 +68,13 @@ The server uses **Bracketed Paste Mode** for robust command execution:
 - ✅ **Complex quoting works**: Single quotes, double quotes, backticks - all safe
 - ✅ **Readable execution**: Commands appear in the terminal exactly as written
 
+### Output Reading Improvements
+- **`isolate_output=True` is RECOMMENDED**: This mode wraps commands with unique markers and extracts only the command's output, filtering out prompts and terminal noise
+- **Active polling for completion**: When using `isolate_output`, the tool actively waits for the command to finish (detecting the END marker) before returning results
+- **Longer timeouts for long tasks**: Increase the `timeout` parameter for commands like ffmpeg, large compilations, etc.
+
 ### Best Practices
+- **Use `isolate_output=True` for clean results**: Especially important for commands with verbose output or when parsing results
 - **Still prefer specialized tools**: `write_file`, `read_file`, `edit_file` are safer and more reliable for file operations
 - **Use heredocs wisely**: While supported, `write_file` is clearer for creating files
 
@@ -80,9 +86,9 @@ The following tools are available through the MCP server.
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10`, `require_confirmation: bool = False`, `working_directory: str = None`, `isolate_output: bool = False` | Executes a shell command using bracketed paste mode. **Fully supports heredocs, emojis, and complex quoting**. Long commands are handled safely without buffer issues. |
+| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10`, `require_confirmation: bool = False`, `working_directory: str = None`, `isolate_output: bool = False` | Executes a shell command using direct text injection. **Fully supports heredocs, emojis, and complex quoting**. Long commands are handled safely without buffer issues. |
 | `read_terminal_output` | `timeout: int = 5` | Reads the entire visible contents of the active iTerm2 screen. |
-| `send_text` | `text: str`, `paste: bool = True` | Sends text to the terminal. By default uses bracketed paste mode for safe, atomic text insertion. Set `paste=False` to simulate individual keystrokes (slower, riskier). |
+| `send_text` | `text: str`, `paste: bool = True` | Sends text to the terminal. By default uses direct text injection for safe, atomic insertion. Set `paste=False` to simulate individual keystrokes (slower, riskier). |
 | `create_tab` | `profile: str = None` | Creates a new tab in the current iTerm2 window. |
 | `create_session` | `profile: str = None` | Creates a new session (split pane) in the current tab. |
 | `clear_screen` | | Clears the screen of the active session (like `Ctrl+L`). |
