@@ -53,15 +53,15 @@ That's it. The MCP client will now handle starting the server for you.
 
 ## Safety Features
 
-The server uses **Temporary Script Execution** for robust command execution:
+The server uses **Smart Command Execution** with automatic complexity detection:
 
-### Temporary Script Execution
-- All commands sent via `run_command` are written to temporary bash scripts in `/tmp/mcp_cmd_*.sh`
-- Scripts are executed via `source` command, then automatically delete themselves
+### Smart Command Execution
+- **Simple commands** (`ls`, `pwd`, `git status`) execute directly for speed
+- **Complex commands** (with quotes, pipes, unicode, subshells) use temporary script files
+- Scripts are written to `/tmp/mcp_cmd_*.sh`, executed, then auto-delete themselves
 - This completely avoids quote interpretation issues that plague terminal automation
-- **Zero shell interpretation** during command transmission - no typing simulation, no quote hell
+- **Automatic detection**: You don't need to choose - the tool detects complexity automatically
 - Supports **heredocs, emojis, complex quoting, and long commands** without any special handling
-- Terminal displays clean `source /tmp/mcp_cmd_abc123.sh` - still readable and debuggable
 
 ### What This Means for Agents
 - ✅ **Heredocs are fully supported**: Use them freely for multi-line file creation or scripts
@@ -70,10 +70,11 @@ The server uses **Temporary Script Execution** for robust command execution:
 - ✅ **Complex quoting works**: Single quotes, double quotes, backticks - all safe
 - ✅ **Readable execution**: Commands appear in the terminal exactly as written
 
-### Output Reading Improvements
+### Output Reading Improvements & Limitations
 - **`isolate_output=True` is RECOMMENDED**: This mode wraps commands with unique markers and extracts only the command's output, filtering out prompts and terminal noise
 - **Active polling for completion**: When using `isolate_output`, the tool actively waits for the command to finish (detecting the END marker) before returning results
 - **Longer timeouts for long tasks**: Increase the `timeout` parameter for commands like ffmpeg, large compilations, etc.
+- **⚠️ Screen Buffer Limitation**: The tool can only read ~200 visible terminal lines. If output is longer and scrolls off-screen, the beginning will be lost. For very long output, redirect to a file: `command > /tmp/output.txt` then use `read_file`.
 
 ### Best Practices
 - **Use `isolate_output=True` for clean results**: Especially important for commands with verbose output or when parsing results
@@ -88,7 +89,7 @@ The following tools are available through the MCP server.
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10`, `require_confirmation: bool = False`, `working_directory: str = None`, `isolate_output: bool = False`, `max_output_chars: int = 10000` | Executes a shell command via temporary script file. **Fully supports heredocs, emojis, and complex quoting**. For clean output parsing, use `isolate_output=True` and adjust `timeout` based on command duration (ffmpeg: 120-300s, builds: 300-600s). |
+| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10`, `require_confirmation: bool = False`, `working_directory: str = None`, `isolate_output: bool = False`, `max_output_chars: int = 10000` | Executes shell commands with automatic complexity detection. Simple commands run directly; complex commands (quotes, pipes, unicode) use temp scripts. **Fully supports heredocs, emojis, and complex quoting**. For clean output parsing, use `isolate_output=True` and adjust `timeout` based on command duration (ffmpeg: 120-300s, builds: 300-600s). |
 | `read_terminal_output` | `timeout: int = 5` | Reads the entire visible contents of the active iTerm2 screen. |
 | `send_text` | `text: str`, `paste: bool = True` | Sends text to the terminal. By default uses async_inject_text for safe insertion. Set `paste=False` to simulate individual keystrokes (slower, riskier). |
 | `create_tab` | `profile: str = None` | Creates a new tab in the current iTerm2 window. |

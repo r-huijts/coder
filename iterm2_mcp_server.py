@@ -310,17 +310,25 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         working_directory (str): Optional directory to cd into before executing the command.
         
         isolate_output (bool): ⭐ HIGHLY RECOMMENDED when you need to parse command output.
+                               ⚠️ CRITICAL: Screen reading only captures VISIBLE terminal lines.
+                               If output is long and scrolls off-screen, you'll miss the beginning!
+                               
                                When True (default False):
                                • Wraps command with unique BEGIN/END markers
                                • Extracts ONLY the command's output (no prompts, no noise)
                                • Actively polls terminal until END marker appears
                                • Returns clean, parseable results
+                               • HOWEVER: Still limited to visible screen buffer (~200 lines)
                                
                                USE isolate_output=True FOR:
                                ✅ Commands whose output you need to read/parse
                                ✅ Long-running commands (ffmpeg, builds, installs)
                                ✅ Commands with verbose/multi-line output
                                ✅ Any time terminal noise would confuse parsing
+                               
+                               FOR VERY LONG OUTPUT (>200 lines):
+                               💡 Redirect to a file and use read_file instead:
+                               Example: "ls -1 *.mp3 > /tmp/list.txt" then read_file("/tmp/list.txt")
                                
                                SKIP isolate_output FOR:
                                • Quick commands where you don't need the output
@@ -368,82 +376,143 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     if not session:
         return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
-    # CRITICAL FIX: Neither async_inject_text nor async_send_text handle complex
-    # commands reliably (they simulate typing which causes quote hell).
-    # Solution: Write command to a temporary file and source it.
-    
-    import tempfile
-    import uuid
-    import os
+    # Determine if we need a temp script or can execute directly
+    # Use temp script for complex commands with problematic patterns
+    def needs_temp_script(cmd):
+        """Returns True if command has patterns that break direct execution"""
+        # Check for complex quoting that causes issues
+        has_quotes = '"' in cmd or "'" in cmd
+        has_backticks = '`' in cmd
+        has_subshell = '$(' in cmd
+        has_pipes = '|' in cmd
+        has_redirects = '>' in cmd or '<' in cmd
+        has_unicode = any(ord(c) > 127 for c in cmd)
+        has_multiple_commands = '&&' in cmd or '||' in cmd or ';' in cmd
+        
+        # If isolate_output is True, we need temp script for markers
+        if isolate_output:
+            return True
+        
+        # Complex command with multiple problematic features = use script
+        complexity_count = sum([
+            has_quotes,
+            has_backticks,
+            has_subshell,
+            has_pipes and has_quotes,
+            has_redirects and has_quotes,
+            has_unicode and has_quotes,
+            has_multiple_commands and has_quotes
+        ])
+        
+        return complexity_count >= 2
     
     # Build the full command including working directory if specified
     full_command = command
     if working_directory:
         safe_dir = str(Path(working_directory).expanduser().resolve())
         full_command = f"cd '{safe_dir}' && {command}"
-
-    # If isolate_output, wrap with unique markers
-    if isolate_output:
-        sid = uuid.uuid4().hex
-        begin = f"__MCP_BEGIN_{sid}__"
-        end = f"__MCP_END_{sid}__"
-        full_command = f"echo '{begin}'; {full_command}; echo '{end}'"
     
-    # Write command to a temporary script file
-    script_id = uuid.uuid4().hex[:8]
-    script_path = f"/tmp/mcp_cmd_{script_id}.sh"
+    use_script = needs_temp_script(command)
     
-    try:
-        # Write the command to the temp file
-        with open(script_path, 'w') as f:
-            f.write("#!/bin/bash\n")
-            f.write("set -e\n")  # Exit on error
-            f.write(full_command + "\n")
-            # Auto-cleanup: remove the script after execution (even on error)
-            f.write(f"EXIT_CODE=$?\n")
-            f.write(f"rm -f {script_path}\n")
-            f.write(f"exit $EXIT_CODE\n")
-        
-        # Make it executable
-        os.chmod(script_path, 0o755)
-        
-        # Execute the script by sourcing it (this is safe and readable)
-        send_method = getattr(session, "async_send_text", None)
-        if not send_method:
-            # Cleanup before returning error
-            if os.path.exists(script_path):
-                os.remove(script_path)
-            return optimize_json_response({
-                "success": False,
-                "error": "async_send_text is not available on this iTerm2 Session."
-            })
-        
-        await send_method(f"source {script_path}\n")
-        
-    except Exception as e:
-        # Clean up on error
-        if os.path.exists(script_path):
-            try:
-                os.remove(script_path)
-            except:
-                pass  # Best effort cleanup
+    send_method = getattr(session, "async_send_text", None)
+    if not send_method:
         return optimize_json_response({
             "success": False,
-            "error": f"Failed to create temporary script: {str(e)}"
+            "error": "async_send_text is not available on this iTerm2 Session."
         })
     
-    result = {
-        "success": True,
-        "command": command,
-        "session_id": session.session_id,
-        "script_path": script_path,
-        "message": f"Executed command via temporary script: {command}",
-        "timestamp": datetime.now().isoformat()
-    }
+    if use_script:
+        # TEMP SCRIPT EXECUTION: For complex commands
+        import uuid
+        import os
+        
+        # If isolate_output, wrap with unique markers
+        if isolate_output:
+            sid = uuid.uuid4().hex
+            begin = f"__MCP_BEGIN_{sid}__"
+            end = f"__MCP_END_{sid}__"
+            full_command = f"echo '{begin}'; {full_command}; echo '{end}'"
+        
+        # Write command to a temporary script file
+        script_id = uuid.uuid4().hex[:8]
+        script_path = f"/tmp/mcp_cmd_{script_id}.sh"
+        
+        try:
+            # Write the command to the temp file
+            with open(script_path, 'w') as f:
+                f.write("#!/bin/bash\n")
+                f.write("set -e\n")  # Exit on error
+                f.write(full_command + "\n")
+                # Auto-cleanup: remove the script after execution (even on error)
+                f.write(f"EXIT_CODE=$?\n")
+                f.write(f"rm -f {script_path}\n")
+                f.write(f"exit $EXIT_CODE\n")
+            
+            # Make it executable
+            os.chmod(script_path, 0o755)
+            
+            # Execute the script directly (respects the shebang)
+            await send_method(f"{script_path}\n")
+            
+        except Exception as e:
+            # Clean up on error
+            if os.path.exists(script_path):
+                try:
+                    os.remove(script_path)
+                except:
+                    pass  # Best effort cleanup
+            return optimize_json_response({
+                "success": False,
+                "error": f"Failed to create temporary script: {str(e)}"
+            })
+        
+        result = {
+            "success": True,
+            "command": command,
+            "session_id": session.session_id,
+            "execution_method": "temp_script",
+            "script_path": script_path,
+            "message": f"Executed command via temporary script: {command}",
+            "timestamp": datetime.now().isoformat()
+        }
+    else:
+        # DIRECT EXECUTION: For simple commands
+        if isolate_output:
+            import uuid
+            sid = uuid.uuid4().hex
+            begin = f"__MCP_BEGIN_{sid}__"
+            end = f"__MCP_END_{sid}__"
+            full_command = f"echo '{begin}'; {full_command}; echo '{end}'"
+        
+        await send_method(f"{full_command}\n")
+        
+        result = {
+            "success": True,
+            "command": command,
+            "session_id": session.session_id,
+            "execution_method": "direct",
+            "message": f"Executed command directly: {command}",
+            "timestamp": datetime.now().isoformat()
+        }
     
     # If requested, wait for and read output (with memory limits)
     if wait_for_output:
         try:
+            # Re-fetch the session to ensure it's still valid
+            ctx = await connection_manager.get_connection()
+            if ctx.get("error"):
+                result["output"] = ""
+                result["error"] = f"Lost connection: {ctx['error']}"
+                result["message"] = f"Executed command: {command} (connection lost)"
+                return optimize_json_response(result)
+            
+            session = ctx["session"]
+            if not session:
+                result["output"] = ""
+                result["error"] = "Session no longer available"
+                result["message"] = f"Executed command: {command} (session lost)"
+                return optimize_json_response(result)
+            
             # For isolate_output mode, we wait for the END marker to appear
             # For normal mode, we wait for the command to likely finish
             if isolate_output:
@@ -570,8 +639,8 @@ async def send_text(text: str, paste: bool = True) -> str:
 
     Args:
         text (str): The text to send to the terminal.
-        paste (bool): If True (default), uses async_inject_text to directly inject
-                      text into the readline buffer, bypassing all shell interpretation.
+        paste (bool): If True (default), uses async_inject to inject bytes directly
+                      into the terminal, bypassing shell interpretation during input.
                       This is much safer and faster for code blocks or long text.
                       If False, simulates individual keystrokes (slower, riskier).
 
@@ -588,12 +657,12 @@ async def send_text(text: str, paste: bool = True) -> str:
 
     try:
         if paste:
-            # Use async_inject_text to directly inject into readline buffer
+            # Use async_inject to inject bytes into the terminal
             # This bypasses shell interpretation entirely - safest method
-            inject_method = getattr(session, "async_inject_text", None)
+            inject_method = getattr(session, "async_inject", None)
             if inject_method:
-                await inject_method(text)
-                method_used = "inject_text"
+                await inject_method(text.encode('utf-8'))
+                method_used = "inject_bytes"
             else:
                 # Fallback to send_text if inject isn't available
                 await session.async_send_text(text)
