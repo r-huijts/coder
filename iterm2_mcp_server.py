@@ -259,6 +259,8 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     
     Executes shell commands in iTerm2. HIGH RISK TOOL with significant limitations.
     
+    💡 FOR CLEAN, PARSEABLE OUTPUT: Use isolate_output=True and set appropriate timeout!
+    
     🚫 FORBIDDEN USES (Use specialized tools instead):
     ❌ File creation/writing: echo 'x' > file.txt → USE write_file
     ❌ File reading: cat, head, tail, less → USE read_file  
@@ -289,18 +291,42 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
 
     Args:
         command (str): The command to execute. Supports heredocs, emojis, and complex quoting safely.
+        
         wait_for_output (bool): If True, waits for the command to finish and captures the output.
-                                Defaults to True.
-        timeout (int): The maximum time in seconds to wait for output. Defaults to 10.
-                       Increase for long-running commands (ffmpeg, compiles, etc).
+                                Defaults to True. Set to False for fire-and-forget commands.
+        
+        timeout (int): Maximum seconds to wait for command completion. Defaults to 10.
+                       ⚠️ IMPORTANT: Adjust based on expected command duration:
+                       • Quick commands (ls, echo, git status): 10s (default)
+                       • Package installs (npm install, pip install): 60-120s
+                       • Media processing (ffmpeg, video encoding): 120-300s
+                       • Large compilations (make, cargo build): 300-600s
+                       If output reading times out, increase this value.
+        
         require_confirmation (bool): If True, allows potentially destructive commands to run.
                                      Defaults to False.
+        
         working_directory (str): Optional directory to cd into before executing the command.
-        isolate_output (bool): RECOMMENDED for clean output. If True, wraps execution with unique
-                               markers and extracts ONLY the command's output, filtering out
-                               prompts, previous commands, and other terminal noise. The tool
-                               will actively wait for the END marker before returning.
+        
+        isolate_output (bool): ⭐ HIGHLY RECOMMENDED when you need to parse command output.
+                               When True (default False):
+                               • Wraps command with unique BEGIN/END markers
+                               • Extracts ONLY the command's output (no prompts, no noise)
+                               • Actively polls terminal until END marker appears
+                               • Returns clean, parseable results
+                               
+                               USE isolate_output=True FOR:
+                               ✅ Commands whose output you need to read/parse
+                               ✅ Long-running commands (ffmpeg, builds, installs)
+                               ✅ Commands with verbose/multi-line output
+                               ✅ Any time terminal noise would confuse parsing
+                               
+                               SKIP isolate_output FOR:
+                               • Quick commands where you don't need the output
+                               • Interactive commands (they won't work with markers)
+        
         max_output_chars (int): Maximum output size to prevent memory issues. Defaults to 10000.
+                                Increase if you expect more output (e.g. large log files).
 
     Returns:
         str: A JSON string containing the execution status and output if captured.

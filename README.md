@@ -86,7 +86,7 @@ The following tools are available through the MCP server.
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10`, `require_confirmation: bool = False`, `working_directory: str = None`, `isolate_output: bool = False` | Executes a shell command using direct text injection. **Fully supports heredocs, emojis, and complex quoting**. Long commands are handled safely without buffer issues. |
+| `run_command` | `command: str`, `wait_for_output: bool = True`, `timeout: int = 10`, `require_confirmation: bool = False`, `working_directory: str = None`, `isolate_output: bool = False`, `max_output_chars: int = 10000` | Executes a shell command using direct text injection. **Fully supports heredocs, emojis, and complex quoting**. For clean output parsing, use `isolate_output=True` and adjust `timeout` based on command duration (ffmpeg: 120-300s, builds: 300-600s). |
 | `read_terminal_output` | `timeout: int = 5` | Reads the entire visible contents of the active iTerm2 screen. |
 | `send_text` | `text: str`, `paste: bool = True` | Sends text to the terminal. By default uses direct text injection for safe, atomic insertion. Set `paste=False` to simulate individual keystrokes (slower, riskier). |
 | `create_tab` | `profile: str = None` | Creates a new tab in the current iTerm2 window. |
