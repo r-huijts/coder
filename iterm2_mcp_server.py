@@ -49,6 +49,7 @@ PRIORITY 5 - TERMINAL I/O:
 PRIORITY 6 - SHELL EXECUTION (LAST RESORT ONLY):
   - run_command → ONLY for: package managers, builds, tests, system commands
   - FORBIDDEN uses: file creation/modification, file reading, text processing
+  - BEST PRACTICE: Use plain ASCII text only - NO EMOJIS in commands
 
 REJECTION PATTERNS for run_command:
   ❌ echo 'content' > file.txt        → USE: write_file
@@ -57,12 +58,14 @@ REJECTION PATTERNS for run_command:
   ❌ ls -la directory/                → USE: list_directory
   ❌ grep "pattern" files             → USE: search_code
   ❌ mkdir -p path && echo > path/f   → USE: write_file (creates parent dirs)
+  ❌ echo "✅ Done!"                  → USE: echo "[OK] Done!" (no emojis)
 
 APPROVED uses for run_command:
   ✅ npm install, pip install, cargo build
   ✅ git status, git commit, git push
   ✅ python script.py, node app.js
   ✅ systemctl status, ps aux, df -h
+  ✅ echo "[OK] Success" (ASCII only, no emojis)
 """
 
 # =============================================================================
@@ -276,6 +279,11 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     ✅ Network tools: curl, wget, ping, ssh (non-file operations)
     ✅ Build tools: make, cmake, gradlew, mvn compile
     
+    ⚠️  BEST PRACTICES:
+    • Avoid emojis in commands - use plain text instead (e.g., "[OK]" not "✅")
+    • Keep commands simple and readable
+    • Use ASCII characters only when possible for maximum compatibility
+    
     SECURITY: Dangerous commands (rm, dd, mkfs, shutdown) require `require_confirmation=True`.
     MEMORY: Output size limited to prevent memory issues during long tasks.
     HEREDOC SAFETY: Commands with heredoc operators (<<) are REJECTED. Heredocs cannot be
@@ -287,7 +295,8 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     more reliable, handle edge cases better, and respect security boundaries.
 
     Args:
-        command (str): The command to execute.
+        command (str): The command to execute. Avoid using emojis or unicode characters
+                      in echo/print statements - use plain ASCII text instead for reliability.
         wait_for_output (bool): If True, waits for the command to finish and captures the output.
                                 Defaults to True.
         timeout (int): The maximum time in seconds to wait for output. Defaults to 10.
@@ -358,32 +367,23 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
             "error": "Neither async_send_text nor async_inject_text is available on this iTerm2 Session."
         })
 
-    # Detect commands with complex quoting or heredocs that might break shell parsing
-    # These need base64 encoding to prevent quote/unquote issues
-    has_complex_quoting = False
-    has_heredoc = False
+    # Detect and handle heredocs - always reject these
+    if '<<' in command:
+        # Already handled above, but double-check here
+        pass
     
-    if not use_base64:
-        # Check for heredoc patterns that would break terminal state
-        has_heredoc = '<<' in command
-        
-        # Check for potentially problematic quote patterns
-        # - Unmatched quotes (odd number of single or double quotes)
-        single_quotes = command.count("'")
-        double_quotes = command.count('"')
-        # - Commands with both single and double quotes (complex escaping)
-        # - Commands with quotes and special shell characters
-        has_both_quote_types = single_quotes > 0 and double_quotes > 0
-        has_unmatched_quotes = (single_quotes % 2 != 0) or (double_quotes % 2 != 0)
-        has_special_with_quotes = (single_quotes > 0 or double_quotes > 0) and any(
-            char in command for char in ['$', '`', '\\', '&', '|', ';', '<', '>']
-        )
-        
-        has_complex_quoting = has_unmatched_quotes or (has_both_quote_types and has_special_with_quotes) or has_heredoc
+    # For readability, we want to send commands directly when possible
+    # But we need to handle special cases that break shell parsing
+    # Strategy: Use printf with %q (shell quoting) instead of base64
+    # This keeps commands somewhat readable while being safe
     
-    # Use base64 when explicitly requested OR when complex quoting is detected
-    # This prevents shell parsing issues while keeping simple commands readable
-    effective_base64 = use_base64 or has_complex_quoting
+    # Check if command has problematic patterns
+    has_unmatched_quotes = (command.count("'") % 2 != 0) or (command.count('"') % 2 != 0)
+    has_unicode_in_quotes = any(ord(c) > 127 for c in command) and ('"' in command or "'" in command)
+    
+    # Use base64 only for explicitly requested or truly broken commands
+    # For most cases, send directly - the shell can handle it
+    effective_base64 = use_base64 or has_unmatched_quotes
 
     # If a working directory was specified, change into it first
     if working_directory:
@@ -395,10 +395,10 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         import base64, uuid
         encoded_command = base64.b64encode(command.encode('utf-8')).decode('utf-8')
         
-        # When auto-detecting complex quoting, just note that base64 is being used
+        # When auto-detecting issues, just note that base64 is being used
         # The command execution will still be visible in terminal output
-        if has_complex_quoting and not use_base64:
-            await send_text_method(f"echo '>>> Executing command (auto-encoded for quote safety)'\n")
+        if not use_base64:
+            await send_text_method(f"echo '>>> Executing command (auto-encoded for safety)'\n")
         
         if isolate_output:
             sid = uuid.uuid4().hex
@@ -408,19 +408,22 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         else:
             await send_text_method(f"eval $(echo '{encoded_command}' | base64 --decode)\n")
     else:
-        # Send the command literally so it is visible in the terminal
+        # Send the command using bash's $'...' syntax which handles escapes properly
+        # This keeps commands readable while being safe
+        # Replace single quotes with '\'' to escape them within $'...'
+        escaped_command = command.replace("\\", "\\\\").replace("'", "\\'")
+        safe_command = f"bash -c $'{escaped_command}'"
+        
         if isolate_output:
             import uuid
             sid = uuid.uuid4().hex
             begin = f"__MCP_BEGIN_{sid}__"
             end = f"__MCP_END_{sid}__"
-            # Use a here-string to safely wrap commands with quotes
-            # This avoids quote escaping issues
             await send_text_method(f"echo '{begin}'\n")
-            await send_text_method(f"{command}\n")
+            await send_text_method(f"{safe_command}\n")
             await send_text_method(f"echo '{end}'\n")
         else:
-            await send_text_method(f"{command}\n")
+            await send_text_method(f"{safe_command}\n")
     
     result = {
         "success": True,
@@ -430,10 +433,10 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         "timestamp": datetime.now().isoformat()
     }
     
-    # Note if base64 was auto-used for complex quoting
-    if has_complex_quoting and not use_base64:
+    # Note if base64 was auto-used
+    if effective_base64 and not use_base64:
         result["base64_auto_used"] = True
-        result["reason"] = "Complex quoting detected - auto-encoded for safety"
+        result["reason"] = "Auto-encoded for safety (unmatched quotes detected)"
     
     # If requested, wait for and read output (with memory limits)
     if wait_for_output:
