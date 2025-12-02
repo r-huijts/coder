@@ -412,6 +412,15 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         safe_dir = str(Path(working_directory).expanduser().resolve())
         full_command = f"cd '{safe_dir}' && {command}"
     
+    marker_begin = None
+    marker_end = None
+    if isolate_output:
+        import uuid
+        sid = uuid.uuid4().hex
+        marker_begin = f"__MCP_BEGIN_{sid}__"
+        marker_end = f"__MCP_END_{sid}__"
+        full_command = f"echo '{marker_begin}'; {full_command}; echo '{marker_end}'"
+    
     use_script = needs_temp_script(command)
     
     send_method = getattr(session, "async_send_text", None)
@@ -425,13 +434,6 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         # TEMP SCRIPT EXECUTION: For complex commands
         import uuid
         import os
-        
-        # If isolate_output, wrap with unique markers
-        if isolate_output:
-            sid = uuid.uuid4().hex
-            begin = f"__MCP_BEGIN_{sid}__"
-            end = f"__MCP_END_{sid}__"
-            full_command = f"echo '{begin}'; {full_command}; echo '{end}'"
         
         # Write command to a temporary script file
         script_id = uuid.uuid4().hex[:8]
@@ -477,13 +479,6 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
         }
     else:
         # DIRECT EXECUTION: For simple commands
-        if isolate_output:
-            import uuid
-            sid = uuid.uuid4().hex
-            begin = f"__MCP_BEGIN_{sid}__"
-            end = f"__MCP_END_{sid}__"
-            full_command = f"echo '{begin}'; {full_command}; echo '{end}'"
-        
         await send_method(f"{full_command}\n")
         
         result = {
@@ -542,49 +537,96 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
                 
                 if not end_marker_found:
                     result["warning"] = f"End marker not found after {timeout}s - output may be incomplete"
+                else:
+                    # CRITICAL: Even after END marker appears, the terminal buffer may still be
+                    # receiving output! Keep checking until line count stabilizes.
+                    stable_count = 0
+                    last_line_count = 0
+                    max_stability_checks = 10
+                    
+                    for _ in range(max_stability_checks):
+                        await asyncio.sleep(0.2)
+                        screen_check = await session.async_get_screen_contents()
+                        if screen_check:
+                            current_line_count = screen_check.number_of_lines
+                            if current_line_count == last_line_count:
+                                stable_count += 1
+                                if stable_count >= 3:  # Stable for 3 checks (0.6s)
+                                    break
+                            else:
+                                stable_count = 0
+                                last_line_count = current_line_count
             else:
                 # For non-isolated mode, give the command time to execute
                 # Use a more reasonable wait time based on timeout
                 await asyncio.sleep(min(1.0, timeout * 0.2))
             
-            # Now read the final output
-            screen = await asyncio.wait_for(
-                session.async_get_screen_contents(),
-                timeout=5  # Quick timeout just for reading
-            )
-            
-            if screen:
-                # Extract the text content using the correct API with limits
+            # Now read the final output using async_get_contents() to include scrollback
+            # This gives us the FULL output, not just what's visible on screen!
+            try:
+                import iterm2
+                
+                # Use Transaction to ensure consistent state
+                async with iterm2.Transaction(ctx["connection"]) as txn:
+                    line_info = await session.async_get_line_info()
+                    
+                    # Calculate how many lines to fetch
+                    # For isolate_output, we ONLY want recent history where our command just ran
+                    # Reading ancient scrollback will capture OLD marker pairs from previous runs!
+                    total_available = line_info.scrollback_buffer_height + line_info.mutable_area_height
+                    
+                    # Read a generous chunk so BEGIN marker remains in buffer even for long commands
+                    max_lines = 2000
+                    num_lines_to_fetch = min(total_available, max_lines)
+                    
+                    # Calculate starting line: ALWAYS read from the END, not the beginning
+                    # This ensures we get the MOST RECENT command output
+                    if total_available > max_lines:
+                        first_line = line_info.overflow + (total_available - max_lines)
+                    else:
+                        first_line = line_info.overflow
+                    
+                    # Fetch the lines
+                    lines = await session.async_get_contents(first_line, num_lines_to_fetch)
+                
+                # Extract text from lines
                 output_text = ""
                 lines_processed = 0
-                max_lines = 200  # Limit lines to prevent memory bloat
                 
-                for i in range(min(screen.number_of_lines, max_lines)):
-                    line = screen.line(i)
+                for line in lines:
                     if line.string:
                         output_text += line.string + "\n"
                         lines_processed += 1
-                        
+                
                 # If requested, extract only marked region
                 if isolate_output:
                     # Find begin/end markers on line boundaries
-                    lines = output_text.splitlines()
-                    begin_idx, end_idx = None, None
-                    for idx, ln in enumerate(lines):
-                        if begin_idx is None and "__MCP_BEGIN_" in ln:
-                            begin_idx = idx + 1  # start after the marker line
-                        elif begin_idx is not None and "__MCP_END_" in ln:
-                            end_idx = idx
-                            break
-                    if begin_idx is not None and end_idx is not None and end_idx >= begin_idx:
-                        output_text = "\n".join(lines[begin_idx:end_idx])
-                    elif begin_idx is not None:
-                        # Found BEGIN but not END - take everything after BEGIN
-                        output_text = "\n".join(lines[begin_idx:])
-                        result["warning"] = (result.get("warning", "") + " Output isolation incomplete - END marker not found").strip()
+                    text_lines = output_text.splitlines()
+                    total_lines_read = len(text_lines)
+                    begin_idx = None
+                    end_idx = None
+                    
+                    if marker_begin and marker_end:
+                        for idx, ln in enumerate(text_lines):
+                            if begin_idx is None and marker_begin in ln:
+                                begin_idx = idx + 1  # start after the marker line
+                                continue
+                            if begin_idx is not None and marker_end in ln:
+                                end_idx = idx
+                                break
                     else:
-                        # Markers not found at all
-                        result["warning"] = (result.get("warning", "") + " Output isolation failed - markers not found").strip()
+                        result["warning"] = (result.get("warning", "") + " Output isolation markers missing for this execution").strip()
+                    
+                    if begin_idx is not None and end_idx is not None and end_idx >= begin_idx:
+                        output_text = "\n".join(text_lines[begin_idx:end_idx])
+                        result["debug_marker_extraction"] = f"BEGIN at line {begin_idx}, END at line {end_idx}, extracted {end_idx - begin_idx} lines from {total_lines_read} total"
+                    elif begin_idx is not None and end_idx is None:
+                        output_text = "\n".join(text_lines[begin_idx:])
+                        result["warning"] = (result.get("warning", "") + f" Output isolation incomplete - END marker not found (BEGIN at {begin_idx}, total lines {total_lines_read})").strip()
+                    elif begin_idx is None and end_idx is not None:
+                        result["warning"] = (result.get("warning", "") + f" Output isolation failed - BEGIN marker missing but END found at line {end_idx}").strip()
+                    else:
+                        result["warning"] = (result.get("warning", "") + f" Output isolation failed - markers not found in {total_lines_read} lines").strip()
 
                 # Truncate if too large
                 if len(output_text) > max_output_chars:
@@ -596,15 +638,17 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
                 result["output"] = output_text.strip()
                 result["output_length"] = len(output_text)
                 result["lines_processed"] = lines_processed
-                result["message"] = f"Executed command: {command} (output captured)"
+                result["message"] = f"Executed command: {command} (output captured with scrollback)"
                 
                 if lines_processed >= max_lines:
                     result["lines_truncated"] = True
                     result["warning"] = (result.get("warning", "") + 
-                                       f" Output limited to {max_lines} lines").strip()
-            else:
+                                       f" Output limited to {max_lines} lines for memory safety").strip()
+                
+            except Exception as read_error:
                 result["output"] = ""
-                result["message"] = f"Executed command: {command} (no output captured)"
+                result["error"] = f"Failed to read output with scrollback: {str(read_error)}"
+                result["message"] = f"Executed command: {command} (failed to read output)"
                 
         except asyncio.TimeoutError:
             result["output"] = ""
