@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-iTerm2 MCP Server using FastMCP - Memory Optimized Version
-A Model Context Protocol server for controlling iTerm2 with better memory management
+iTerm2 MCP Server using FastMCP - Shell Integration Enhanced Version
+A Model Context Protocol server for controlling iTerm2 with Shell Integration support
 """
 
 import json
@@ -12,7 +12,7 @@ import shutil
 import weakref
 import gc
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime
 
@@ -73,21 +73,23 @@ APPROVED uses for run_command:
 # =============================================================================
 
 class iTerm2ConnectionManager:
-    """Manages iTerm2 connections with memory optimization"""
+    """Manages iTerm2 connections with memory optimization and Shell Integration detection"""
     
     def __init__(self):
         self._connection = None
         self._last_used = None
         self._connection_timeout = 300  # 5 minutes
+        self._shell_integration_available = None  # Cached detection result
+        self._shell_integration_checked_session = None  # Session ID we checked
         
     async def get_connection(self):
         """Get or create a reusable iTerm2 connection"""
         now = datetime.now()
         
-        # Check if we need a new connection
+        # Check if we need a new connection - FIXED: use total_seconds()
         if (self._connection is None or 
             self._last_used is None or 
-            (now - self._last_used).seconds > self._connection_timeout):
+            (now - self._last_used).total_seconds() > self._connection_timeout):
             
             # Clean up old connection
             if self._connection:
@@ -96,6 +98,9 @@ class iTerm2ConnectionManager:
                 except:
                     pass
                 self._connection = None
+                # Reset shell integration cache when connection changes
+                self._shell_integration_available = None
+                self._shell_integration_checked_session = None
             
             # Create new connection
             try:
@@ -123,6 +128,29 @@ class iTerm2ConnectionManager:
         except Exception as e:
             return {"error": f"iTerm2 context retrieval failed: {str(e)}"}
     
+    async def check_shell_integration(self, connection, session) -> bool:
+        """
+        Check if Shell Integration is available for the current session.
+        Caches the result per session to avoid repeated checks.
+        """
+        if session is None:
+            return False
+            
+        # Return cached result if we already checked this session
+        if (self._shell_integration_available is not None and 
+            self._shell_integration_checked_session == session.session_id):
+            return self._shell_integration_available
+        
+        try:
+            prompt = await iterm2.async_get_last_prompt(connection, session.session_id)
+            self._shell_integration_available = prompt is not None
+            self._shell_integration_checked_session = session.session_id
+            return self._shell_integration_available
+        except Exception:
+            self._shell_integration_available = False
+            self._shell_integration_checked_session = session.session_id
+            return False
+    
     async def cleanup(self):
         """Explicit cleanup for connection"""
         if self._connection:
@@ -131,6 +159,8 @@ class iTerm2ConnectionManager:
             except:
                 pass
             self._connection = None
+        self._shell_integration_available = None
+        self._shell_integration_checked_session = None
         gc.collect()  # Force garbage collection
 
 # Global connection manager
@@ -153,6 +183,286 @@ def optimize_json_response(data: Dict[Any, Any], max_output_size: int = 10000) -
     else:
         return json.dumps(data, indent=2)
 
+
+# =============================================================================
+# SHELL INTEGRATION HELPERS
+# =============================================================================
+
+async def run_command_with_shell_integration(
+    connection, 
+    session, 
+    command: str, 
+    timeout: int = 30,
+    max_output_chars: int = 10000,
+    working_directory: Optional[str] = None
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Run a command using Shell Integration for reliable output capture.
+    Uses a temp script to avoid quoting issues with direct text injection.
+    
+    Returns:
+        Tuple of (success, output, metadata)
+    """
+    import uuid
+    
+    metadata = {
+        "method": "shell_integration",
+        "timeout": timeout
+    }
+    
+    # Build the full command
+    full_command = command
+    if working_directory:
+        safe_dir = str(Path(working_directory).expanduser().resolve())
+        full_command = f"cd '{safe_dir}' && {command}"
+    
+    # Write command to temp script to avoid quoting issues
+    script_id = uuid.uuid4().hex[:8]
+    script_path = f"/tmp/mcp_cmd_{script_id}.sh"
+    
+    try:
+        with open(script_path, 'w') as f:
+            f.write("#!/bin/bash\n")
+            f.write(full_command + "\n")
+            f.write(f"rm -f {script_path}\n")  # Self-cleanup
+        
+        os.chmod(script_path, 0o755)
+        metadata["script_path"] = script_path
+        
+    except Exception as e:
+        return False, "", {"error": f"Failed to create temp script: {str(e)}"}
+    
+    try:
+        # Step 1: Get the current prompt (before our command)
+        pre_prompt = await iterm2.async_get_last_prompt(connection, session.session_id)
+        if not pre_prompt:
+            return False, "", {"error": "Could not get prompt - Shell Integration may not be active"}
+        
+        metadata["pre_prompt_id"] = pre_prompt.unique_id
+        
+        # Step 2: Start monitoring for command completion BEFORE sending
+        modes = [iterm2.PromptMonitor.Mode.COMMAND_END]
+        
+        async with iterm2.PromptMonitor(connection, session.session_id, modes) as monitor:
+            # Send the script path (not the raw command)
+            await session.async_send_text(f"{script_path}\n")
+            
+            # Wait for COMMAND_END with timeout
+            try:
+                await asyncio.wait_for(monitor.async_get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                metadata["warning"] = f"Command did not complete within {timeout}s timeout"
+                # Continue anyway - try to get whatever output we can
+        
+        # Step 3: Get the prompt info for our command (now completed)
+        post_prompt = await iterm2.async_get_last_prompt(connection, session.session_id)
+        
+        if not post_prompt:
+            return False, "", {"error": "Could not get post-command prompt"}
+        
+        metadata["post_prompt_id"] = post_prompt.unique_id
+        metadata["command_recorded"] = post_prompt.command
+        
+        # Step 4: Extract output using the output_range
+        output_range = post_prompt.output_range
+        
+        if output_range:
+            start_y = output_range.start.y
+            end_y = output_range.end.y
+            num_lines = end_y - start_y
+            
+            metadata["output_range"] = {"start": start_y, "end": end_y, "lines": num_lines}
+            
+            if num_lines > 0:
+                # Fetch the content
+                async with iterm2.Transaction(connection):
+                    contents = await session.async_get_contents(start_y, num_lines)
+                
+                # Build output string
+                output_lines = []
+                for line in contents:
+                    if line.string:
+                        output_lines.append(line.string)
+                
+                output = "\n".join(output_lines)
+                
+                # Truncate if needed
+                if len(output) > max_output_chars:
+                    output = output[:max_output_chars]
+                    metadata["output_truncated"] = True
+                    metadata["original_length"] = len(output)
+                
+                return True, output, metadata
+            else:
+                return True, "", metadata
+        else:
+            # No output range available - command may have produced no output
+            return True, "", {"warning": "No output range available", **metadata}
+            
+    except Exception as e:
+        return False, "", {"error": str(e), **metadata}
+
+
+async def run_command_with_markers(
+    connection,
+    session, 
+    command: str, 
+    timeout: int = 30,
+    max_output_chars: int = 10000,
+    working_directory: Optional[str] = None
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Fallback method: Run command with BEGIN/END markers for output capture.
+    Used when Shell Integration is not available.
+    
+    Returns:
+        Tuple of (success, output, metadata)
+    """
+    import uuid
+    
+    metadata = {
+        "method": "marker_based",
+        "timeout": timeout
+    }
+    
+    # Build the full command with markers
+    sid = uuid.uuid4().hex
+    marker_begin = f"__MCP_BEGIN_{sid}__"
+    marker_end = f"__MCP_END_{sid}__"
+    
+    full_command = command
+    if working_directory:
+        safe_dir = str(Path(working_directory).expanduser().resolve())
+        full_command = f"cd '{safe_dir}' && {command}"
+    
+    wrapped_command = f"echo '{marker_begin}'; {full_command}; echo '{marker_end}'"
+    
+    # Write to temp script for reliable execution
+    script_id = uuid.uuid4().hex[:8]
+    script_path = f"/tmp/mcp_cmd_{script_id}.sh"
+    
+    try:
+        with open(script_path, 'w') as f:
+            f.write("#!/bin/bash\n")
+            f.write("set -e\n")
+            f.write(wrapped_command + "\n")
+            f.write(f"rm -f {script_path}\n")
+        
+        os.chmod(script_path, 0o755)
+        metadata["script_path"] = script_path
+        
+        # Execute
+        await session.async_send_text(f"{script_path}\n")
+        
+    except Exception as e:
+        if os.path.exists(script_path):
+            try:
+                os.remove(script_path)
+            except:
+                pass
+        return False, "", {"error": f"Failed to create script: {str(e)}"}
+    
+    # Poll for end marker
+    end_marker_found = False
+    poll_interval = 0.1
+    elapsed = 0
+    
+    while elapsed < timeout and not end_marker_found:
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+        
+        try:
+            screen = await session.async_get_screen_contents()
+            if screen:
+                check_lines = min(50, screen.number_of_lines)
+                for i in range(screen.number_of_lines - check_lines, screen.number_of_lines):
+                    line = screen.line(i)
+                    if line and line.string and marker_end in line.string:
+                        end_marker_found = True
+                        break
+        except:
+            pass
+        
+        poll_interval = min(poll_interval * 1.5, 1.0)
+    
+    if not end_marker_found:
+        metadata["warning"] = f"End marker not found after {timeout}s"
+    
+    # Wait for output to stabilize
+    if end_marker_found:
+        stable_count = 0
+        last_line_count = 0
+        for _ in range(10):
+            await asyncio.sleep(0.2)
+            try:
+                screen_check = await session.async_get_screen_contents()
+                if screen_check:
+                    current_line_count = screen_check.number_of_lines
+                    if current_line_count == last_line_count:
+                        stable_count += 1
+                        if stable_count >= 3:
+                            break
+                    else:
+                        stable_count = 0
+                        last_line_count = current_line_count
+            except:
+                break
+    
+    # Read output with scrollback
+    try:
+        async with iterm2.Transaction(connection):
+            line_info = await session.async_get_line_info()
+            total_available = line_info.scrollback_buffer_height + line_info.mutable_area_height
+            max_lines = 2000
+            num_lines_to_fetch = min(total_available, max_lines)
+            
+            if total_available > max_lines:
+                first_line = line_info.overflow + (total_available - max_lines)
+            else:
+                first_line = line_info.overflow
+            
+            lines = await session.async_get_contents(first_line, num_lines_to_fetch)
+        
+        # Extract text
+        output_text = ""
+        for line in lines:
+            if line.string:
+                output_text += line.string + "\n"
+        
+        # Find markers
+        text_lines = output_text.splitlines()
+        begin_idx = None
+        end_idx = None
+        
+        for idx, ln in enumerate(text_lines):
+            if begin_idx is None and marker_begin in ln:
+                begin_idx = idx + 1
+                continue
+            if begin_idx is not None and marker_end in ln:
+                end_idx = idx
+                break
+        
+        if begin_idx is not None and end_idx is not None and end_idx >= begin_idx:
+            output = "\n".join(text_lines[begin_idx:end_idx])
+            metadata["marker_extraction"] = f"BEGIN at {begin_idx}, END at {end_idx}"
+        elif begin_idx is not None:
+            output = "\n".join(text_lines[begin_idx:])
+            metadata["warning"] = (metadata.get("warning", "") + f" BEGIN found at {begin_idx}, END not found").strip()
+        else:
+            output = output_text
+            metadata["warning"] = (metadata.get("warning", "") + " Markers not found, returning raw output").strip()
+        
+        # Truncate if needed
+        if len(output) > max_output_chars:
+            output = output[:max_output_chars]
+            metadata["output_truncated"] = True
+        
+        return True, output.strip(), metadata
+        
+    except Exception as e:
+        return False, "", {"error": f"Failed to read output: {str(e)}", **metadata}
+
+
 # =============================================================================
 # OPTIMIZED CORE TOOLS
 # =============================================================================
@@ -162,7 +472,7 @@ async def create_tab(profile: Optional[str] = None) -> str:
     """
     🛸 PRIORITY 4 - NEW TAB CREATOR 🛸
     
-    Creates a new iTerm2 tab for organizing terminal sessions.
+    Creates a new iTerm2 tab in the current window for organizing terminal sessions.
     
     🎯 USE THIS TOOL FOR:
     ✅ Setting up new development environments
@@ -183,16 +493,21 @@ async def create_tab(profile: Optional[str] = None) -> str:
         return optimize_json_response({"success": False, "error": ctx["error"]})
 
     connection = ctx["connection"]
+    window = ctx["window"]
+    
+    if not window:
+        return optimize_json_response({"success": False, "error": "No active iTerm2 window found."})
+    
+    # FIXED: Create a tab in current window, not a new window
     if profile:
         profile_obj = await iterm2.Profile.async_get(connection, [profile])
         if profile_obj:
-            window = await iterm2.Window.async_create(connection, profile=profile_obj[0])
+            tab = await window.async_create_tab(profile=profile_obj[0])
         else:
-            window = await iterm2.Window.async_create(connection)
+            tab = await window.async_create_tab()
     else:
-        window = await iterm2.Window.async_create(connection)
+        tab = await window.async_create_tab()
     
-    tab = window.current_tab
     session = tab.current_session
     
     result = {
@@ -227,39 +542,51 @@ async def create_session(profile: Optional[str] = None) -> str:
     if ctx.get("error"):
         return optimize_json_response({"success": False, "error": ctx["error"]})
 
-    connection, tab = ctx["connection"], ctx["tab"]
-    if not tab:
-        return optimize_json_response({"success": False, "error": "No active iTerm2 tab found."})
+    connection, session = ctx["connection"], ctx["session"]
+    if not session:
+        return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
+    # Split the current session
     if profile:
         profile_obj = await iterm2.Profile.async_get(connection, [profile])
         if profile_obj:
-            session = await tab.async_create_session(profile=profile_obj[0])
+            new_session = await session.async_split_pane(profile=profile_obj[0])
         else:
-            session = await tab.async_create_session()
+            new_session = await session.async_split_pane()
     else:
-        session = await tab.async_create_session()
+        new_session = await session.async_split_pane()
     
     result = {
         "success": True,
-        "session_id": session.session_id,
-        "message": f"Created new session {session.session_id}"
+        "session_id": new_session.session_id,
+        "message": f"Created new split pane session {new_session.session_id}"
     }
     
     return optimize_json_response(result)
 
 
 @mcp.tool()
-async def run_command(command: str, wait_for_output: bool = True, timeout: int = 10, 
-                      require_confirmation: bool = False, 
-                      working_directory: Optional[str] = None, 
-                      isolate_output: bool = False, max_output_chars: int = 10000) -> str:
+async def run_command(
+    command: str, 
+    wait_for_output: bool = True, 
+    timeout: int = 30, 
+    require_confirmation: bool = False, 
+    working_directory: Optional[str] = None, 
+    max_output_chars: int = 50000
+) -> str:
     """
     ⚠️  SHELL EXECUTION - USE AS LAST RESORT ONLY ⚠️
     
-    Executes shell commands in iTerm2. HIGH RISK TOOL with significant limitations.
+    Executes shell commands in iTerm2 with Shell Integration support for reliable output capture.
     
-    💡 FOR CLEAN, PARSEABLE OUTPUT: Use isolate_output=True and set appropriate timeout!
+    🎯 SHELL INTEGRATION (when available):
+    • Automatically detects command completion
+    • Captures exact output range (no markers needed)
+    • More reliable than polling-based approaches
+    
+    🎯 FALLBACK MODE (when Shell Integration unavailable):
+    • Uses BEGIN/END markers for output isolation
+    • Polls for completion with exponential backoff
     
     🚫 FORBIDDEN USES (Use specialized tools instead):
     ❌ File creation/writing: echo 'x' > file.txt → USE write_file
@@ -267,7 +594,6 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     ❌ File editing: sed -i, ed, perl -i → USE edit_file
     ❌ Directory listing: ls, find → USE list_directory
     ❌ Text searching: grep, rg, ag → USE search_code
-    ❌ File operations: mv, cp, rm → USE write_file/edit_file + confirmation
     
     ✅ APPROVED USES ONLY:
     ✅ Package managers: npm install, pip install, cargo build, brew install
@@ -277,389 +603,97 @@ async def run_command(command: str, wait_for_output: bool = True, timeout: int =
     ✅ Network tools: curl, wget, ping, ssh (non-file operations)
     ✅ Build tools: make, cmake, gradlew, mvn compile
     
-    ✅ SAFE FEATURES (New):
-    • HEREDOCS: Fully supported via temporary script execution.
-    • EMOJIS: Fully supported.
-    • LONG COMMANDS: Fully supported (no buffer limits).
-    • COMPLEX QUOTING: All quoting patterns work reliably.
-    
     SECURITY: Dangerous commands (rm, dd, mkfs, shutdown) require `require_confirmation=True`.
-    MEMORY: Output size limited to prevent memory issues during long tasks.
-    
-    ⚠️  WARNING: This tool bypasses safety mechanisms of specialized file tools.
-    Prefer write_file/edit_file/read_file for ANY file operations - they are safer,
-    more reliable, handle edge cases better, and respect security boundaries.
 
     Args:
-        command (str): The command to execute. Supports heredocs, emojis, and complex quoting safely.
-        
-        wait_for_output (bool): If True, waits for the command to finish and captures the output.
-                                Defaults to True. Set to False for fire-and-forget commands.
-        
-        timeout (int): Maximum seconds to wait for command completion. Defaults to 10.
-                       ⚠️ IMPORTANT: Adjust based on expected command duration:
-                       • Quick commands (ls, echo, git status): 10s (default)
-                       • Package installs (npm install, pip install): 60-120s
-                       • Media processing (ffmpeg, video encoding): 120-300s
-                       • Large compilations (make, cargo build): 300-600s
-                       If output reading times out, increase this value.
-        
-        require_confirmation (bool): If True, allows potentially destructive commands to run.
-                                     Defaults to False.
-        
-        working_directory (str): Optional directory to cd into before executing the command.
-        
-        isolate_output (bool): ⭐ HIGHLY RECOMMENDED when you need to parse command output.
-                               ⚠️ CRITICAL: Screen reading only captures VISIBLE terminal lines.
-                               If output is long and scrolls off-screen, you'll miss the beginning!
-                               
-                               When True (default False):
-                               • Wraps command with unique BEGIN/END markers
-                               • Extracts ONLY the command's output (no prompts, no noise)
-                               • Actively polls terminal until END marker appears
-                               • Returns clean, parseable results
-                               • HOWEVER: Still limited to visible screen buffer (~200 lines)
-                               
-                               USE isolate_output=True FOR:
-                               ✅ Commands whose output you need to read/parse
-                               ✅ Long-running commands (ffmpeg, builds, installs)
-                               ✅ Commands with verbose/multi-line output
-                               ✅ Any time terminal noise would confuse parsing
-                               
-                               FOR VERY LONG OUTPUT (>200 lines):
-                               💡 Redirect to a file and use read_file instead:
-                               Example: "ls -1 *.mp3 > /tmp/list.txt" then read_file("/tmp/list.txt")
-                               
-                               SKIP isolate_output FOR:
-                               • Quick commands where you don't need the output
-                               • Interactive commands (they won't work with markers)
-        
-        max_output_chars (int): Maximum output size to prevent memory issues. Defaults to 10000.
-                                Increase if you expect more output (e.g. large log files).
+        command (str): The command to execute.
+        wait_for_output (bool): If True, waits for command completion and captures output. Defaults to True.
+        timeout (int): Maximum seconds to wait for command completion. Defaults to 30.
+                       Adjust based on expected duration:
+                       • Quick commands (git status): 10-30s
+                       • Package installs: 60-120s
+                       • Media processing (ffmpeg): 120-300s
+                       • Large compilations: 300-600s
+        require_confirmation (bool): Required for destructive commands. Defaults to False.
+        working_directory (str): Optional directory to cd into before executing.
+        max_output_chars (int): Maximum output size. Defaults to 50000.
 
     Returns:
-        str: A JSON string containing the execution status and output if captured.
+        str: A JSON string containing execution status, output, and metadata.
     """
     ctx = await connection_manager.get_connection()
     if ctx.get("error"):
         return optimize_json_response({"success": False, "error": ctx["error"]})
 
-    # Heredocs are now fully supported via direct text injection - no special handling needed
-
-    DANGEROUS_COMMANDS = ["rm ", "dd ", "mkfs ", "shutdown ", "reboot "]
+    # Security check for dangerous commands
+    DANGEROUS_COMMANDS = ["rm ", "rm -", "dd ", "mkfs ", "shutdown ", "reboot "]
     if any(cmd in command for cmd in DANGEROUS_COMMANDS) and not require_confirmation:
-        # Provide an elicitation-style payload for compatible clients
         return optimize_json_response({
             "success": False,
             "error": "This command is potentially destructive.",
-            "action_required": "confirmation",
-            "elicitation": {
-                "method": "elicitation/requestInput",
-                "params": {
-                    "message": f"Confirm execution of potentially destructive command: {command}",
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "confirm": {
-                                "type": "boolean",
-                                "description": "Confirm running the command"
-                            }
-                        },
-                        "required": ["confirm"]
-                    }
-                }
-            },
             "hint": "Re-run with require_confirmation=True to proceed."
         })
 
+    connection = ctx["connection"]
     session = ctx["session"]
     if not session:
         return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
-    # Determine if we need a temp script or can execute directly
-    # Use temp script for complex commands with problematic patterns
-    def needs_temp_script(cmd):
-        """Returns True if command has patterns that break direct execution"""
-        # Check for complex quoting that causes issues
-        has_quotes = '"' in cmd or "'" in cmd
-        has_backticks = '`' in cmd
-        has_subshell = '$(' in cmd
-        has_pipes = '|' in cmd
-        has_redirects = '>' in cmd or '<' in cmd
-        has_unicode = any(ord(c) > 127 for c in cmd)
-        has_multiple_commands = '&&' in cmd or '||' in cmd or ';' in cmd
+    result = {
+        "success": True,
+        "command": command,
+        "session_id": session.session_id,
+        "timestamp": datetime.now().isoformat()
+    }
+
+    if not wait_for_output:
+        # Fire-and-forget mode
+        full_command = command
+        if working_directory:
+            safe_dir = str(Path(working_directory).expanduser().resolve())
+            full_command = f"cd '{safe_dir}' && {command}"
         
-        # If isolate_output is True, we need temp script for markers
-        if isolate_output:
-            return True
+        await session.async_send_text(full_command + "\n")
+        result["message"] = f"Command sent (fire-and-forget): {command}"
+        result["output"] = ""
+        return optimize_json_response(result)
+
+    # Check if Shell Integration is available
+    shell_integration = await connection_manager.check_shell_integration(connection, session)
+    
+    if shell_integration:
+        # Use Shell Integration for reliable output capture
+        success, output, metadata = await run_command_with_shell_integration(
+            connection, session, command, timeout, max_output_chars, working_directory
+        )
         
-        # Complex command with multiple problematic features = use script
-        complexity_count = sum([
-            has_quotes,
-            has_backticks,
-            has_subshell,
-            has_pipes and has_quotes,
-            has_redirects and has_quotes,
-            has_unicode and has_quotes,
-            has_multiple_commands and has_quotes
-        ])
+        result["output"] = output
+        result["output_length"] = len(output)
+        result["shell_integration"] = True
+        result.update(metadata)
         
-        return complexity_count >= 2
-    
-    # Build the full command including working directory if specified
-    full_command = command
-    if working_directory:
-        safe_dir = str(Path(working_directory).expanduser().resolve())
-        full_command = f"cd '{safe_dir}' && {command}"
-    
-    marker_begin = None
-    marker_end = None
-    if isolate_output:
-        import uuid
-        sid = uuid.uuid4().hex
-        marker_begin = f"__MCP_BEGIN_{sid}__"
-        marker_end = f"__MCP_END_{sid}__"
-        full_command = f"echo '{marker_begin}'; {full_command}; echo '{marker_end}'"
-    
-    use_script = needs_temp_script(command)
-    
-    send_method = getattr(session, "async_send_text", None)
-    if not send_method:
-        return optimize_json_response({
-            "success": False,
-            "error": "async_send_text is not available on this iTerm2 Session."
-        })
-    
-    if use_script:
-        # TEMP SCRIPT EXECUTION: For complex commands
-        import uuid
-        import os
-        
-        # Write command to a temporary script file
-        script_id = uuid.uuid4().hex[:8]
-        script_path = f"/tmp/mcp_cmd_{script_id}.sh"
-        
-        try:
-            # Write the command to the temp file
-            with open(script_path, 'w') as f:
-                f.write("#!/bin/bash\n")
-                f.write("set -e\n")  # Exit on error
-                f.write(full_command + "\n")
-                # Auto-cleanup: remove the script after execution (even on error)
-                f.write(f"EXIT_CODE=$?\n")
-                f.write(f"rm -f {script_path}\n")
-                f.write(f"exit $EXIT_CODE\n")
+        if not success:
+            result["success"] = False
             
-            # Make it executable
-            os.chmod(script_path, 0o755)
-            
-            # Execute the script directly (respects the shebang)
-            await send_method(f"{script_path}\n")
-            
-        except Exception as e:
-            # Clean up on error
-            if os.path.exists(script_path):
-                try:
-                    os.remove(script_path)
-                except:
-                    pass  # Best effort cleanup
-            return optimize_json_response({
-                "success": False,
-                "error": f"Failed to create temporary script: {str(e)}"
-            })
+        result["message"] = f"Executed via Shell Integration: {command}"
         
-        result = {
-            "success": True,
-            "command": command,
-            "session_id": session.session_id,
-            "execution_method": "temp_script",
-            "script_path": script_path,
-            "message": f"Executed command via temporary script: {command}",
-            "timestamp": datetime.now().isoformat()
-        }
     else:
-        # DIRECT EXECUTION: For simple commands
-        await send_method(f"{full_command}\n")
+        # Fallback to marker-based approach
+        success, output, metadata = await run_command_with_markers(
+            connection, session, command, timeout, max_output_chars, working_directory
+        )
         
-        result = {
-            "success": True,
-            "command": command,
-            "session_id": session.session_id,
-            "execution_method": "direct",
-            "message": f"Executed command directly: {command}",
-            "timestamp": datetime.now().isoformat()
-        }
-    
-    # If requested, wait for and read output (with memory limits)
-    if wait_for_output:
-        try:
-            # Re-fetch the session to ensure it's still valid
-            ctx = await connection_manager.get_connection()
-            if ctx.get("error"):
-                result["output"] = ""
-                result["error"] = f"Lost connection: {ctx['error']}"
-                result["message"] = f"Executed command: {command} (connection lost)"
-                return optimize_json_response(result)
+        result["output"] = output
+        result["output_length"] = len(output)
+        result["shell_integration"] = False
+        result.update(metadata)
+        
+        if not success:
+            result["success"] = False
             
-            session = ctx["session"]
-            if not session:
-                result["output"] = ""
-                result["error"] = "Session no longer available"
-                result["message"] = f"Executed command: {command} (session lost)"
-                return optimize_json_response(result)
-            
-            # For isolate_output mode, we wait for the END marker to appear
-            # For normal mode, we wait for the command to likely finish
-            if isolate_output:
-                # Poll for the end marker with exponential backoff
-                end_marker_found = False
-                poll_interval = 0.1
-                max_wait = timeout
-                elapsed = 0
-                
-                while elapsed < max_wait and not end_marker_found:
-                    await asyncio.sleep(poll_interval)
-                    elapsed += poll_interval
-                    
-                    # Read screen and check for end marker
-                    screen = await session.async_get_screen_contents()
-                    if screen:
-                        # Check last N lines for the end marker
-                        check_lines = min(50, screen.number_of_lines)
-                        for i in range(screen.number_of_lines - check_lines, screen.number_of_lines):
-                            line = screen.line(i)
-                            if line and line.string and "__MCP_END_" in line.string:
-                                end_marker_found = True
-                                break
-                    
-                    # Exponential backoff up to 1 second
-                    poll_interval = min(poll_interval * 1.5, 1.0)
-                
-                if not end_marker_found:
-                    result["warning"] = f"End marker not found after {timeout}s - output may be incomplete"
-                else:
-                    # CRITICAL: Even after END marker appears, the terminal buffer may still be
-                    # receiving output! Keep checking until line count stabilizes.
-                    stable_count = 0
-                    last_line_count = 0
-                    max_stability_checks = 10
-                    
-                    for _ in range(max_stability_checks):
-                        await asyncio.sleep(0.2)
-                        screen_check = await session.async_get_screen_contents()
-                        if screen_check:
-                            current_line_count = screen_check.number_of_lines
-                            if current_line_count == last_line_count:
-                                stable_count += 1
-                                if stable_count >= 3:  # Stable for 3 checks (0.6s)
-                                    break
-                            else:
-                                stable_count = 0
-                                last_line_count = current_line_count
-            else:
-                # For non-isolated mode, give the command time to execute
-                # Use a more reasonable wait time based on timeout
-                await asyncio.sleep(min(1.0, timeout * 0.2))
-            
-            # Now read the final output using async_get_contents() to include scrollback
-            # This gives us the FULL output, not just what's visible on screen!
-            try:
-                import iterm2
-                
-                # Use Transaction to ensure consistent state
-                async with iterm2.Transaction(ctx["connection"]) as txn:
-                    line_info = await session.async_get_line_info()
-                    
-                    # Calculate how many lines to fetch
-                    # For isolate_output, we ONLY want recent history where our command just ran
-                    # Reading ancient scrollback will capture OLD marker pairs from previous runs!
-                    total_available = line_info.scrollback_buffer_height + line_info.mutable_area_height
-                    
-                    # Read a generous chunk so BEGIN marker remains in buffer even for long commands
-                    max_lines = 2000
-                    num_lines_to_fetch = min(total_available, max_lines)
-                    
-                    # Calculate starting line: ALWAYS read from the END, not the beginning
-                    # This ensures we get the MOST RECENT command output
-                    if total_available > max_lines:
-                        first_line = line_info.overflow + (total_available - max_lines)
-                    else:
-                        first_line = line_info.overflow
-                    
-                    # Fetch the lines
-                    lines = await session.async_get_contents(first_line, num_lines_to_fetch)
-                
-                # Extract text from lines
-                output_text = ""
-                lines_processed = 0
-                
-                for line in lines:
-                    if line.string:
-                        output_text += line.string + "\n"
-                        lines_processed += 1
-                
-                # If requested, extract only marked region
-                if isolate_output:
-                    # Find begin/end markers on line boundaries
-                    text_lines = output_text.splitlines()
-                    total_lines_read = len(text_lines)
-                    begin_idx = None
-                    end_idx = None
-                    
-                    if marker_begin and marker_end:
-                        for idx, ln in enumerate(text_lines):
-                            if begin_idx is None and marker_begin in ln:
-                                begin_idx = idx + 1  # start after the marker line
-                                continue
-                            if begin_idx is not None and marker_end in ln:
-                                end_idx = idx
-                                break
-                    else:
-                        result["warning"] = (result.get("warning", "") + " Output isolation markers missing for this execution").strip()
-                    
-                    if begin_idx is not None and end_idx is not None and end_idx >= begin_idx:
-                        output_text = "\n".join(text_lines[begin_idx:end_idx])
-                        result["debug_marker_extraction"] = f"BEGIN at line {begin_idx}, END at line {end_idx}, extracted {end_idx - begin_idx} lines from {total_lines_read} total"
-                    elif begin_idx is not None and end_idx is None:
-                        output_text = "\n".join(text_lines[begin_idx:])
-                        result["warning"] = (result.get("warning", "") + f" Output isolation incomplete - END marker not found (BEGIN at {begin_idx}, total lines {total_lines_read})").strip()
-                    elif begin_idx is None and end_idx is not None:
-                        result["warning"] = (result.get("warning", "") + f" Output isolation failed - BEGIN marker missing but END found at line {end_idx}").strip()
-                    else:
-                        result["warning"] = (result.get("warning", "") + f" Output isolation failed - markers not found in {total_lines_read} lines").strip()
+        result["message"] = f"Executed via markers (Shell Integration unavailable): {command}"
 
-                # Truncate if too large
-                if len(output_text) > max_output_chars:
-                    output_text = output_text[:max_output_chars]
-                    result["output_truncated"] = True
-                    result["warning"] = (result.get("warning", "") + 
-                                       f" Output truncated at {max_output_chars} characters").strip()
-
-                result["output"] = output_text.strip()
-                result["output_length"] = len(output_text)
-                result["lines_processed"] = lines_processed
-                result["message"] = f"Executed command: {command} (output captured with scrollback)"
-                
-                if lines_processed >= max_lines:
-                    result["lines_truncated"] = True
-                    result["warning"] = (result.get("warning", "") + 
-                                       f" Output limited to {max_lines} lines for memory safety").strip()
-                
-            except Exception as read_error:
-                result["output"] = ""
-                result["error"] = f"Failed to read output with scrollback: {str(read_error)}"
-                result["message"] = f"Executed command: {command} (failed to read output)"
-                
-        except asyncio.TimeoutError:
-            result["output"] = ""
-            result["error"] = f"Timeout waiting for command output after {timeout} seconds"
-            result["message"] = f"Executed command: {command} (timeout waiting for output)"
-        except Exception as e:
-            result["output"] = ""
-            result["error"] = f"Failed to read output: {str(e)}"
-            result["message"] = f"Executed command: {command} (failed to read output)"
-    
-    return optimize_json_response(result)
+    return optimize_json_response(result, max_output_size=max_output_chars)
 
 
 @mcp.tool()
@@ -701,18 +735,14 @@ async def send_text(text: str, paste: bool = True) -> str:
 
     try:
         if paste:
-            # Use async_inject to inject bytes into the terminal
-            # This bypasses shell interpretation entirely - safest method
             inject_method = getattr(session, "async_inject", None)
             if inject_method:
                 await inject_method(text.encode('utf-8'))
                 method_used = "inject_bytes"
             else:
-                # Fallback to send_text if inject isn't available
                 await session.async_send_text(text)
                 method_used = "send_text_fallback"
         else:
-            # Send as raw keystrokes (character by character simulation)
             await session.async_send_text(text)
             method_used = "raw_keystrokes"
         
@@ -821,7 +851,7 @@ async def clear_screen() -> str:
     """
     🧹 PRIORITY 4 - SCREEN CLEANER 🧹
     
-    Clears terminal screen (equivalent to Ctrl+L).
+    Clears terminal screen using ANSI escape codes.
     
     🎯 USE FOR: Cleaning cluttered terminal display.
     TERMINAL-SPECIFIC: Clears current iTerm2 session screen only.
@@ -838,7 +868,8 @@ async def clear_screen() -> str:
         return optimize_json_response({"success": False, "error": "No active iTerm2 session found."})
 
     try:
-        await session.async_send_text("\x0c")  # Form feed character
+        # FIXED: Use proper ANSI escape sequence for clear + cursor home
+        await session.async_send_text("\x1b[2J\x1b[H")
         
         result = {
             "success": True,
@@ -928,28 +959,33 @@ async def get_session_info() -> str:
     """
     ℹ️  PRIORITY 4 - SESSION INFO ℹ️
     
-    Gets current iTerm2 window/tab/session IDs for debugging.
+    Gets current iTerm2 window/tab/session IDs and Shell Integration status.
     
     🎯 USE FOR: Terminal context and debugging.
     READ-ONLY: Safe information retrieval.
 
     Returns:
-        str: A JSON string containing the window, tab, and session IDs.
+        str: A JSON string containing session info and capabilities.
     """
     ctx = await connection_manager.get_connection()
     if ctx.get("error"):
         return optimize_json_response({"success": False, "error": ctx["error"]})
 
+    connection = ctx["connection"]
     window, tab, session = ctx["window"], ctx["tab"], ctx["session"]
     if not (window and tab and session):
         return optimize_json_response({"success": False, "error": "Could not retrieve complete session info."})
 
+    # Check Shell Integration status
+    shell_integration = await connection_manager.check_shell_integration(connection, session)
+    
     result = {
         "success": True,
         "window_id": window.window_id,
         "tab_id": tab.tab_id,
         "session_id": session.session_id,
-        "message": f"Current session: {session.session_id}"
+        "shell_integration_available": shell_integration,
+        "message": f"Current session: {session.session_id} (Shell Integration: {'enabled' if shell_integration else 'disabled'})"
     }
     
     return optimize_json_response(result)
@@ -994,24 +1030,26 @@ async def write_file(file_path: str, content: str, require_confirmation: bool = 
     Returns:
         str: A JSON string confirming success or reporting an error.
     """
+    # Expand user path and resolve
+    resolved_path = Path(file_path).expanduser().resolve()
+    
     # Create parent directories if they don't exist
-    parent_dir = Path(file_path).parent
-    parent_dir.mkdir(parents=True, exist_ok=True)
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if os.path.exists(file_path) and not require_confirmation:
+    if resolved_path.exists() and not require_confirmation:
         return optimize_json_response({
             "success": False,
             "error": f"File '{file_path}' already exists. Set `require_confirmation=True` to overwrite."
         })
 
     try:
-        with open(file_path, "w") as f:
+        with open(resolved_path, "w") as f:
             f.write(content)
         result = {
             "success": True,
-            "file_path": file_path,
+            "file_path": str(resolved_path),
             "content_length": len(content),
-            "message": f"Successfully wrote {len(content)} characters to {file_path}"
+            "message": f"Successfully wrote {len(content)} characters to {resolved_path}"
         }
         return optimize_json_response(result)
     except Exception as e:
@@ -1060,8 +1098,11 @@ async def read_file(file_path: str, start_line: Optional[int] = None, end_line: 
         str: A JSON string with the file content or an error.
     """
     try:
+        # Expand user path
+        resolved_path = Path(file_path).expanduser().resolve()
+        
         # Check file size before reading
-        file_size = os.path.getsize(file_path)
+        file_size = os.path.getsize(resolved_path)
         max_size_bytes = max_size_mb * 1024 * 1024
         
         if file_size > max_size_bytes:
@@ -1071,7 +1112,7 @@ async def read_file(file_path: str, start_line: Optional[int] = None, end_line: 
                 "hint": "Use start_line/end_line parameters to read specific sections or increase max_size_mb"
             })
         
-        with open(file_path, 'r') as f:
+        with open(resolved_path, 'r') as f:
             if start_line is not None or end_line is not None:
                 # Read only specific lines to save memory
                 lines = []
@@ -1092,7 +1133,7 @@ async def read_file(file_path: str, start_line: Optional[int] = None, end_line: 
             
         result = {
             "success": True,
-            "file_path": file_path,
+            "file_path": str(resolved_path),
             "content": content,
             "file_size_bytes": file_size,
             "content_length": len(content)
@@ -1224,7 +1265,10 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
         })
 
     try:
-        with open(file_path, 'r') as f:
+        # Expand user path
+        resolved_path = Path(file_path).expanduser().resolve()
+        
+        with open(resolved_path, 'r') as f:
             lines = f.readlines()
 
         # Adjust for 0-based indexing
@@ -1240,15 +1284,15 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
         # Replace the specified lines
         lines[start_index:end_index] = new_lines
 
-        with open(file_path, 'w') as f:
+        with open(resolved_path, 'w') as f:
             f.writelines(lines)
 
         result = {
             "success": True,
-            "file_path": file_path,
+            "file_path": str(resolved_path),
             "lines_replaced": end_line - start_line + 1,
             "new_lines_count": len(new_lines),
-            "message": f"Successfully replaced lines {start_line}-{end_line} in {file_path}"
+            "message": f"Successfully replaced lines {start_line}-{end_line} in {resolved_path}"
         }
         return optimize_json_response(result)
     except FileNotFoundError:
@@ -1260,7 +1304,7 @@ async def edit_file(file_path: str, start_line: int, end_line: int, new_content:
 
 
 @mcp.tool()
-async def search_code(query: str, path: str = ".", case_sensitive: bool = True) -> str:
+async def search_code(query: str, search_path: str = ".", case_sensitive: bool = True) -> str:
     """
     🔍 PRIORITY 2 - CODE SEARCH TOOL 🔍
     
@@ -1276,7 +1320,7 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
     
     🚫 NEVER USE run_command FOR:
     ❌ grep -r "pattern" directory/
-    ❌ find . -name "*.py" -exec grep "pattern" {} \;
+    ❌ find . -name "*.py" -exec grep "pattern" {} \\;
     ❌ rg "pattern" files/
     ❌ ag "pattern" directory/
     ❌ ack "pattern" 
@@ -1293,7 +1337,7 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
 
     Args:
         query (str): The string or regex pattern to search for.
-        path (str): The file or directory to search in. Defaults to the current directory.
+        search_path (str): The file or directory to search in. Defaults to the current directory.
         case_sensitive (bool): Whether the search should be case-sensitive. Defaults to True.
 
     Returns:
@@ -1305,9 +1349,9 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
         if not rg_path:
             # Fallback to common hardcoded paths if not in PATH
             common_paths = ["/opt/homebrew/bin/rg", "/usr/local/bin/rg"]
-            for path in common_paths:
-                if os.path.exists(path):
-                    rg_path = path
+            for p in common_paths:  # FIXED: renamed from 'path' to 'p' to avoid shadowing
+                if os.path.exists(p):
+                    rg_path = p
                     break
         
         if not rg_path:
@@ -1316,7 +1360,7 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
                 "error": "The 'rg' (ripgrep) command was not found in your PATH or common locations. Please install it and ensure it's accessible."
             })
 
-        command = [rg_path, '--json', query, path]
+        command = [rg_path, '--json', query, search_path]
         if not case_sensitive:
             command.insert(1, '-i')
 
@@ -1328,8 +1372,6 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
         stdout, stderr = await process.communicate()
 
         if process.returncode != 0 and stderr:
-            # Ripgrep exits with 1 if no matches are found, which is not an error for us.
-            # A real error will have content in stderr.
             error_message = stderr.decode().strip()
             if "No files were searched" not in error_message:
                  return optimize_json_response({"success": False, "error": error_message})
@@ -1346,7 +1388,6 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
                         "line_content": data['lines']['text'].strip()
                     })
             except (json.JSONDecodeError, KeyError):
-                # Ignore lines that aren't valid JSON or don't have the expected structure
                 continue
         
         result = {
@@ -1354,12 +1395,13 @@ async def search_code(query: str, path: str = ".", case_sensitive: bool = True) 
             "query": query, 
             "results": results,
             "results_count": len(results),
-            "search_path": path
+            "search_path": search_path
         }
         
         return optimize_json_response(result)
     except Exception as e:
         return optimize_json_response({"success": False, "error": str(e)})
+
 
 # =============================================================================
 # MEMORY MANAGEMENT TOOLS
@@ -1375,7 +1417,7 @@ async def cleanup_connections() -> str:
     """
     try:
         await connection_manager.cleanup()
-        gc.collect()  # Force garbage collection
+        gc.collect()
         
         result = {
             "success": True,
@@ -1387,6 +1429,7 @@ async def cleanup_connections() -> str:
         
     except Exception as e:
         return optimize_json_response({"success": False, "error": str(e)})
+
 
 @mcp.tool()
 async def get_memory_stats() -> str:
@@ -1417,7 +1460,9 @@ async def get_memory_stats() -> str:
             "memory_stats": memory_stats,
             "connection_manager": {
                 "has_active_connection": connection_manager._connection is not None,
-                "last_used": connection_manager._last_used.isoformat() if connection_manager._last_used else None
+                "last_used": connection_manager._last_used.isoformat() if connection_manager._last_used else None,
+                "shell_integration_cached": connection_manager._shell_integration_available,
+                "shell_integration_session": connection_manager._shell_integration_checked_session
             },
             "timestamp": datetime.now().isoformat()
         }
@@ -1427,9 +1472,10 @@ async def get_memory_stats() -> str:
     except Exception as e:
         return optimize_json_response({"success": False, "error": str(e)})
 
+
 if __name__ == "__main__":
     # Run the FastMCP server with proper cleanup
-    print("Starting memory-optimized iTerm2 MCP server...", file=sys.stderr)
+    print("Starting Shell Integration enhanced iTerm2 MCP server...", file=sys.stderr)
     try:
         mcp.run()
     except KeyboardInterrupt:
