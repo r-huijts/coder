@@ -204,6 +204,18 @@ async def run_command_with_shell_integration(
         Tuple of (success, output, metadata)
     """
     import uuid
+    # #region agent log
+    import time as _dbg_time
+    _dbg_run_id = f"run_{uuid.uuid4().hex[:8]}"
+    _dbg_log_path = "/Users/happyhawking/Documents/Projects/Current/coder/.cursor/debug.log"
+    def _dbg_log(hyp, loc, msg, data=None):
+        try:
+            import json
+            with open(_dbg_log_path, 'a') as f:
+                f.write(json.dumps({"hypothesisId": hyp, "location": loc, "message": msg, "data": data or {}, "timestamp": _dbg_time.time(), "runId": _dbg_run_id}) + "\n")
+        except: pass
+    _dbg_log("A,D", "shell_int:entry", "Function entry", {"command": command[:100], "timeout": timeout, "session_id": session.session_id if session else None, "connection_id": id(connection)})
+    # #endregion
     
     metadata = {
         "method": "shell_integration",
@@ -217,14 +229,21 @@ async def run_command_with_shell_integration(
         full_command = f"cd '{safe_dir}' && {command}"
     
     # Write command to temp script to avoid quoting issues
+    # Enhanced: Capture output explicitly so shell integration can track it
     script_id = uuid.uuid4().hex[:8]
     script_path = f"/tmp/mcp_cmd_{script_id}.sh"
     
     try:
         with open(script_path, 'w') as f:
             f.write("#!/bin/bash\n")
-            f.write(full_command + "\n")
+            # Capture command output to ensure shell integration can track it
+            # Use 2>&1 to capture both stdout and stderr
+            f.write(f"OUTPUT=$({full_command} 2>&1)\n")
+            f.write("EXIT_CODE=$?\n")
+            # Explicitly echo output so shell integration can capture it
+            f.write('echo "$OUTPUT"\n')
             f.write(f"rm -f {script_path}\n")  # Self-cleanup
+            f.write("exit $EXIT_CODE\n")
         
         os.chmod(script_path, 0o755)
         metadata["script_path"] = script_path
@@ -243,14 +262,29 @@ async def run_command_with_shell_integration(
         # Step 2: Start monitoring for command completion BEFORE sending
         modes = [iterm2.PromptMonitor.Mode.COMMAND_END]
         
+        # #region agent log
+        _dbg_log("B", "shell_int:before_monitor", "About to enter PromptMonitor context", {"session_id": session.session_id})
+        # #endregion
         async with iterm2.PromptMonitor(connection, session.session_id, modes) as monitor:
+            # #region agent log
+            _dbg_log("B", "shell_int:inside_monitor", "Inside PromptMonitor, about to send script", {"script_path": script_path})
+            # #endregion
             # Send the script path (not the raw command)
             await session.async_send_text(f"{script_path}\n")
             
             # Wait for COMMAND_END with timeout
             try:
+                # #region agent log
+                _dbg_log("B", "shell_int:before_async_get", "About to call monitor.async_get()", {"timeout": timeout})
+                # #endregion
                 await asyncio.wait_for(monitor.async_get(), timeout=timeout)
+                # #region agent log
+                _dbg_log("B", "shell_int:after_async_get", "monitor.async_get() completed successfully")
+                # #endregion
             except asyncio.TimeoutError:
+                # #region agent log
+                _dbg_log("B", "shell_int:async_get_timeout", "monitor.async_get() timed out", {"timeout": timeout})
+                # #endregion
                 metadata["warning"] = f"Command did not complete within {timeout}s timeout"
                 # Continue anyway - try to get whatever output we can
         
@@ -274,9 +308,32 @@ async def run_command_with_shell_integration(
             metadata["output_range"] = {"start": start_y, "end": end_y, "lines": num_lines}
             
             if num_lines > 0:
-                # Fetch the content
-                async with iterm2.Transaction(connection):
-                    contents = await session.async_get_contents(start_y, num_lines)
+                # Fetch the content with timeout protection to prevent iTerm2 hangs
+                # #region agent log
+                _dbg_log("A,C", "shell_int:before_transaction1", "About to enter Transaction for output_range read", {"start_y": start_y, "num_lines": num_lines})
+                # #endregion
+                try:
+                    # Use timeout to prevent async_get_contents from hanging indefinitely
+                    async with iterm2.Transaction(connection):
+                        # #region agent log
+                        _dbg_log("A,C", "shell_int:inside_transaction1", "Inside Transaction, about to call async_get_contents", {"start_y": start_y, "num_lines": num_lines})
+                        # #endregion
+                        contents = await asyncio.wait_for(
+                            session.async_get_contents(start_y, num_lines),
+                            timeout=5.0  # 5 second timeout for content fetch
+                        )
+                        # #region agent log
+                        _dbg_log("A,C", "shell_int:after_get_contents1", "async_get_contents completed", {"lines_returned": len(contents) if contents else 0})
+                        # #endregion
+                    # #region agent log
+                    _dbg_log("A", "shell_int:after_transaction1", "Exited Transaction context")
+                    # #endregion
+                except asyncio.TimeoutError:
+                    # #region agent log
+                    _dbg_log("A,C", "shell_int:transaction_timeout", "async_get_contents timed out - falling back", {"start_y": start_y, "num_lines": num_lines})
+                    # #endregion
+                    metadata["warning"] = "Content fetch timed out, using fallback"
+                    contents = []
                 
                 # Build output string
                 output_lines = []
@@ -292,12 +349,157 @@ async def run_command_with_shell_integration(
                     metadata["output_truncated"] = True
                     metadata["original_length"] = len(output)
                 
+                # #region agent log
+                _dbg_log("A", "shell_int:exit_success_output_range", "Exiting with output from output_range", {"output_len": len(output)})
+                # #endregion
                 return True, output, metadata
             else:
-                return True, "", metadata
+                # output_range exists but has 0 lines - try fallback
+                # #region agent log
+                _dbg_log("A", "shell_int:output_range_zero", "output_range had 0 lines, going to fallback")
+                # #endregion
+                metadata["output_range_fallback"] = "output_range had 0 lines, trying manual read"
         else:
-            # No output range available - command may have produced no output
-            return True, "", {"warning": "No output range available", **metadata}
+            # No output range available - try fallback
+            metadata["output_range_fallback"] = "output_range was None, trying manual read"
+        
+        # Fallback: Manually read output between prompts if output_range failed
+        try:
+            # Try to get coordinate information from prompts
+            pre_coord = getattr(pre_prompt, 'coord', None)
+            post_coord = getattr(post_prompt, 'coord', None)
+            
+            # Alternative: try to use line numbers if available
+            pre_line = getattr(pre_prompt, 'line_number', None)
+            post_line = getattr(post_prompt, 'line_number', None)
+            
+            # Determine start and end lines for reading
+            start_line = None
+            end_line = None
+            
+            if pre_coord and post_coord:
+                # Use coordinates if available
+                start_line = pre_coord.y + 1  # Start after the pre_prompt line
+                end_line = post_coord.y  # End before the post_prompt line
+            elif pre_line is not None and post_line is not None:
+                # Use line numbers if available
+                start_line = pre_line + 1
+                end_line = post_line
+            else:
+                # Last resort: try reading recent screen contents
+                # Read last 50 lines and look for output
+                try:
+                    # #region agent log
+                    _dbg_log("A,C", "shell_int:before_fallback_transaction", "About to enter fallback Transaction for screen read")
+                    # #endregion
+                    async with iterm2.Transaction(connection):
+                        # #region agent log
+                        _dbg_log("A", "shell_int:inside_fallback_transaction", "Inside fallback Transaction, getting line_info")
+                        # #endregion
+                        line_info = await session.async_get_line_info()
+                        if line_info:
+                            total_lines = line_info.scrollback_buffer_height + line_info.mutable_area_height
+                            # Read last 50 lines as fallback
+                            read_start = max(0, total_lines - 50)
+                            read_count = min(50, total_lines - read_start)
+                            if read_count > 0:
+                                # #region agent log
+                                _dbg_log("C,E", "shell_int:before_fallback_get_contents", "About to call async_get_contents in fallback", {"read_start": read_start, "read_count": read_count, "total_lines": total_lines})
+                                # #endregion
+                                try:
+                                    contents = await asyncio.wait_for(
+                                        session.async_get_contents(read_start, read_count),
+                                        timeout=5.0  # 5 second timeout
+                                    )
+                                except asyncio.TimeoutError:
+                                    _dbg_log("C,E", "shell_int:fallback_get_contents_timeout", "Fallback async_get_contents timed out")
+                                    contents = []
+                                # #region agent log
+                                _dbg_log("C,E", "shell_int:after_fallback_get_contents", "Fallback async_get_contents completed", {"lines_returned": len(contents) if contents else 0})
+                                # #endregion
+                                
+                                # Build output string, filtering out script path
+                                output_lines = []
+                                script_path_basename = os.path.basename(script_path)
+                                for line in contents:
+                                    if line.string:
+                                        line_str = line.string.strip()
+                                        # Skip the script execution line itself and empty lines
+                                        if (script_path_basename not in line_str and 
+                                            script_path not in line_str and 
+                                            line_str and
+                                            not line_str.startswith('rm -f')):
+                                            output_lines.append(line.string)
+                                
+                                if output_lines:
+                                    output = "\n".join(output_lines).strip()
+                                    
+                                    # Truncate if needed
+                                    if len(output) > max_output_chars:
+                                        output = output[:max_output_chars]
+                                        metadata["output_truncated"] = True
+                                        metadata["original_length"] = len(output)
+                                    
+                                    metadata["extraction_method"] = "screen_fallback"
+                                    return True, output, metadata
+                except Exception:
+                    pass
+            
+            # If we have valid start/end lines, read between them
+            if start_line is not None and end_line is not None and end_line > start_line:
+                lines_to_read = end_line - start_line
+                if lines_to_read > 0 and lines_to_read < 1000:  # Sanity check
+                    # #region agent log
+                    _dbg_log("A,C", "shell_int:before_manual_transaction", "About to enter Transaction for manual read", {"start_line": start_line, "end_line": end_line, "lines_to_read": lines_to_read})
+                    # #endregion
+                    try:
+                        async with iterm2.Transaction(connection):
+                            # #region agent log
+                            _dbg_log("A,C", "shell_int:inside_manual_transaction", "Inside manual Transaction, calling async_get_contents")
+                            # #endregion
+                            contents = await asyncio.wait_for(
+                                session.async_get_contents(start_line, lines_to_read),
+                                timeout=5.0  # 5 second timeout
+                            )
+                            # #region agent log
+                            _dbg_log("A,C", "shell_int:after_manual_get_contents", "Manual async_get_contents completed", {"lines_returned": len(contents) if contents else 0})
+                            # #endregion
+                    except asyncio.TimeoutError:
+                        _dbg_log("A,C", "shell_int:manual_transaction_timeout", "Manual async_get_contents timed out")
+                        contents = []
+                    
+                    # Build output string, filtering out the script path line
+                    output_lines = []
+                    script_path_basename = os.path.basename(script_path)
+                    for line in contents:
+                        if line.string:
+                            line_str = line.string.strip()
+                            # Skip the script execution line itself and cleanup commands
+                            if (script_path_basename not in line_str and 
+                                script_path not in line_str and 
+                                line_str and
+                                not line_str.startswith('rm -f')):
+                                output_lines.append(line.string)
+                    
+                    if output_lines:
+                        output = "\n".join(output_lines).strip()
+                        
+                        # Truncate if needed
+                        if len(output) > max_output_chars:
+                            output = output[:max_output_chars]
+                            metadata["output_truncated"] = True
+                            metadata["original_length"] = len(output)
+                        
+                        metadata["extraction_method"] = "manual_fallback"
+                        return True, output, metadata
+            
+            # If we get here, no output was found
+            return True, "", {"warning": "No output found via output_range or manual fallback", **metadata}
+            
+        except Exception as fallback_error:
+            # If fallback also fails, return empty with error info
+            metadata["fallback_error"] = str(fallback_error)
+            return True, "", {"warning": "Output extraction failed, fallback also failed", **metadata}
             
     except Exception as e:
         return False, "", {"error": str(e), **metadata}
@@ -565,6 +767,17 @@ async def create_session(profile: Optional[str] = None) -> str:
     return optimize_json_response(result)
 
 
+# #region agent log - top level logger
+import time as _dbg_time_top
+_dbg_log_path_top = "/Users/happyhawking/Documents/Projects/Current/coder/.cursor/debug.log"
+def _dbg_log_top(hyp, loc, msg, data=None):
+    try:
+        import json, uuid
+        with open(_dbg_log_path_top, 'a') as f:
+            f.write(json.dumps({"hypothesisId": hyp, "location": loc, "message": msg, "data": data or {}, "timestamp": _dbg_time_top.time(), "runId": f"top_{uuid.uuid4().hex[:6]}"}) + "\n")
+    except: pass
+# #endregion
+
 @mcp.tool()
 async def run_command(
     command: str, 
@@ -621,7 +834,13 @@ async def run_command(
     Returns:
         str: A JSON string containing execution status, output, and metadata.
     """
+    # #region agent log
+    _dbg_log_top("F", "run_command:entry", "run_command called", {"command": command[:100] if command else None, "timeout": timeout, "wait": wait_for_output})
+    # #endregion
     ctx = await connection_manager.get_connection()
+    # #region agent log
+    _dbg_log_top("F", "run_command:got_connection", "Got connection context", {"has_error": ctx.get("error") is not None, "has_session": ctx.get("session") is not None})
+    # #endregion
     if ctx.get("error"):
         return optimize_json_response({"success": False, "error": ctx["error"]})
 
@@ -693,6 +912,9 @@ async def run_command(
             
         result["message"] = f"Executed via markers (Shell Integration unavailable): {command}"
 
+    # #region agent log
+    _dbg_log_top("F", "run_command:exit", "run_command returning", {"success": result.get("success"), "output_len": len(result.get("output", ""))})
+    # #endregion
     return optimize_json_response(result, max_output_size=max_output_chars)
 
 
